@@ -671,8 +671,8 @@ button:hover:not(:disabled) { background:#f0f2f3; } button:disabled { opacity:.5
 label{display:flex;flex-direction:column;gap:3px}input,select,textarea{padding:6px;border:1px solid #b7bcc2;border-radius:4px;background:#fff}
 h1,h2{margin:0;font-weight:normal}h1{font-size:20px}h2{font-size:16px}code{font-size:11px;color:#555}
 .app-header{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:10px;min-height:52px;padding:8px 12px;border-bottom:1px solid var(--line);background:#fff}
-.project-title{flex:none;font-size:17px;font-weight:600}.recording-name{max-width:260px;overflow:hidden;color:var(--muted);text-overflow:ellipsis;white-space:nowrap}.header-actions{display:flex;align-items:center;gap:6px;margin-left:auto}.header-actions #save-status{font-size:12px;color:#555}.header-actions #save-status.dirty{color:#855000}
-.recording-start{display:grid;min-height:calc(100vh - 52px);place-items:start center;padding:11vh 20px;background:#f6f7f8}.open-card{width:min(420px,100%);padding:32px;border:1px solid var(--line);border-radius:10px;background:#fff;box-shadow:0 8px 30px #15191d12}.open-card h1{margin-bottom:24px;text-align:center}.open-folder{width:100%;padding:10px}.open-divider{display:flex;align-items:center;gap:10px;margin:18px 0;color:#8a9097;font-size:12px}.open-divider::before,.open-divider::after{height:1px;flex:1;background:#e1e3e6;content:""}.recording-form{display:grid;grid-template-columns:1fr auto;gap:8px}.recording-form input,.recording-form select{min-width:0}.recording-form select{grid-column:1/-1}.start-status{min-height:20px;margin:16px 0 0;color:var(--muted);font-size:12px;text-align:center}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}
+.project-title{flex:none;font-size:17px;font-weight:600}.recording-name{min-width:0;max-width:370px;overflow:hidden;color:var(--muted);text-overflow:ellipsis;white-space:nowrap}.header-actions{display:flex;align-items:center;gap:6px;margin-left:auto}.header-actions #save-status{font-size:12px;color:#555}.header-actions #save-status.dirty{color:#855000}
+.recording-start{display:grid;min-height:calc(100vh - 52px);place-items:start center;padding:11vh 20px;background:#f6f7f8}.open-card{width:min(500px,100%);padding:32px;border:1px solid var(--line);border-radius:10px;background:#fff;box-shadow:0 8px 30px #15191d12}.open-card h1{margin-bottom:24px;text-align:center}.open-folder{width:100%;padding:10px}.open-divider{display:flex;align-items:center;gap:10px;margin:18px 0;color:#8a9097;font-size:12px}.open-divider::before,.open-divider::after{height:1px;flex:1;background:#e1e3e6;content:""}.recording-form{display:grid;gap:8px}.recording-form input,.recording-form select,.recording-form button{width:100%;min-width:0;min-height:34px}.start-status{min-height:20px;margin:16px 0 0;color:var(--muted);font-size:12px;text-align:center}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}
 .banner{display:flex;align-items:center;gap:8px;padding:7px 10px;border-bottom:1px solid #ccc;background:#fffbd3;font-size:12px}.banner span{flex:1}
 .workspace,.review-area{width:100%;max-width:none}.review-area{padding:10px}.review-toolbar,.transport,.tools-row{display:flex;align-items:center;flex-wrap:wrap;gap:7px 14px;margin:8px 0}.review-toolbar label,.transport label{flex-direction:row;align-items:center}.review-toolbar input[type=range]{width:80px}.review-toolbar #shortcuts{width:30px;margin-left:auto;padding:5px}
 .sam-progress{display:flex;min-width:280px;align-items:center;gap:7px;color:var(--muted);font-size:11px}.sam-progress progress{width:170px;height:12px}.mask-chip{flex:none;padding:2px 7px;border:1px solid #8db8ae;border-radius:12px;color:#075f54!important;background:#edf8f5;font-size:11px!important}
@@ -695,7 +695,7 @@ dialog{width:470px;max-width:95vw;padding:16px;border:1px solid #555}dialog labe
 /* VIA's stock stylesheet targets #view_container. The CoLoc adapter mounts one view per .via-host. */
 .via-host .view_content_container{display:grid}.via-host .file_container video{max-width:100%;max-height:100%}.via-timeline-host .view_metadata_container{display:block}.via-timeline-host .temporal_segmenter_container canvas{display:block}
 @media(max-width:900px){.viewer-grid,.tracks-grid,.paired-grid{grid-template-columns:1fr}.via-host{height:420px;grid-template-rows:minmax(330px,1fr)!important}.segment-row{grid-template-columns:20px 1fr 55px 130px}.header-actions{margin-left:0}.app-header{flex-wrap:wrap}.review-toolbar #shortcuts{align-self:flex-start}}
-@media(max-width:560px){.recording-form{grid-template-columns:1fr}.list-filters{flex-wrap:wrap}.list-filters input{flex-basis:100%}.two-fields{grid-template-columns:1fr}.category-picker{width:100%}.category-picker-header{grid-template-columns:1fr}.category-group h3{width:88px}.header-actions #save-status{display:none}}
+@media(max-width:560px){.list-filters{flex-wrap:wrap}.list-filters input{flex-basis:100%}.two-fields{grid-template-columns:1fr}.category-picker{width:100%}.category-picker-header{grid-template-columns:1fr}.category-group h3{width:88px}.header-actions #save-status{display:none}}
 </style>
 <!-- END: Contents of file: src/styles.css-->
 </head>
@@ -713,7 +713,7 @@ dialog{width:470px;max-width:95vw;padding:16px;border:1px solid #555}dialog labe
   <main id="recording-start" class="recording-start">
     <section class="open-card">
       <h1>Open a recording</h1>
-      <button id="open-folder" class="primary open-folder">Open clip folder</button>
+      <button id="open-folder" class="primary open-folder">Open local clip folder</button>
       <input id="folder-input" type="file" webkitdirectory multiple hidden>
       <div class="open-divider"><span>or</span></div>
       <form id="recording-form" class="recording-form">
@@ -12996,6 +12996,7 @@ async function initialize() {
   savedContent = contentKey(project);
   selected = null;
   $('recording-name').textContent = meta.recording_id;
+  $('recording-name').title = meta.recording_id;
   $('recording-name').classList.remove('hidden');
   $('open-recording').classList.remove('hidden');
   $('category-list').replaceChildren(...meta.labels.map(label => new Option(label)));
@@ -13132,19 +13133,30 @@ $('recording-id').oninput = () => {
   $('recording-clip').replaceChildren();
   $('recording-clip').hidden = true;
   $('open-recording-id').textContent = 'Find clips';
+  $('open-recording-id').disabled = false;
   $('recording-start-status').textContent = '';
   $('recording-start-status').classList.remove('error-text');
+};
+$('recording-clip').onchange = () => {
+  $('open-recording-id').disabled = !$('recording-clip').value;
 };
 $('recording-form').onsubmit = event => {
   event.preventDefault();
   const recordingId = $('recording-id').value.trim();
   if (!recordingId) return;
   const clip = $('recording-clip').value;
+  const submit = $('open-recording-id');
+  if (submit.disabled) return;
+  submit.disabled = true;
   $('recording-start-status').classList.remove('error-text');
   $('recording-start-status').textContent = clip ? 'Opening clip…' : 'Finding clips…';
   run(async () => {
     try {
-      if (clip) return await openRecording(await StaticRecording.fromRecordingId(recordingId, clip));
+      if (clip) {
+        await openRecording(await StaticRecording.fromRecordingId(recordingId, clip));
+        submit.disabled = false;
+        return;
+      }
       const clips = await StaticRecording.clipsFromRecordingId(recordingId);
       if (!clips.length) throw new Error('This recording has no annotation clips.');
       $('recording-clip').replaceChildren(...clips.map(name => {
@@ -13154,11 +13166,13 @@ $('recording-form').onsubmit = event => {
         return option;
       }));
       $('recording-clip').hidden = false;
-      $('open-recording-id').textContent = 'Open clip';
+      submit.textContent = 'Open clip';
+      submit.disabled = false;
       $('recording-start-status').textContent = `${clips.length} clips found.`;
     } catch (error) {
       $('recording-start-status').textContent = error.message;
       $('recording-start-status').classList.add('error-text');
+      submit.disabled = false;
       throw error;
     }
   })();
