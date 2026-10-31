@@ -1,0 +1,121 @@
+html {
+  min-width: 320px;
+  background: #fff;
+}
+
+body {
+  min-height: 100vh;
+  color: #202124;
+  font-family: "Noto Sans", sans-serif;
+}
+
+main {
+  display: grid;
+  min-height: calc(100vh - 88px);
+  align-items: center;
+}
+
+.publication-header .hero-body {
+  padding: 5rem 1.5rem 4rem;
+}
+
+.publication-title {
+  max-width: 980px;
+  margin: 0 auto 2.25rem !important;
+  color: #202124;
+  font-family: "Google Sans", "Noto Sans", sans-serif;
+  font-size: clamp(2.35rem, 5.5vw, 4.4rem) !important;
+  font-weight: 400;
+  line-height: 1.08;
+  letter-spacing: -0.035em;
+}
+
+.project-name {
+  font-weight: 700;
+}
+
+.publication-links {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.75rem;
+}
+
+.publication-links .button {
+  height: 2.75rem;
+  padding: 0 1.2rem;
+  border: 0;
+  background: #363636;
+  font-size: 1rem;
+  transition: background 140ms ease, transform 140ms ease;
+}
+
+.publication-links a.button:hover,
+.publication-links a.button:focus-visible {
+  background: #111;
+  transform: translateY(-1px);
+}
+
+.publication-links .is-disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+  user-select: none;
+}
+
+.publication-links .icon {
+  width: 1.15rem;
+  height: 1.15rem;
+  margin-right: 0.35rem !important;
+}
+
+.publication-links svg {
+  width: 100%;
+  height: 100%;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+.publication-links small {
+  font-size: 0.72em;
+  opacity: 0.82;
+}
+
+.footer {
+  padding: 1.75rem 1.5rem;
+  background: #fafafa;
+  color: #777;
+  font-size: 0.78rem;
+}
+
+.footer a {
+  color: #555;
+  text-decoration: underline;
+}
+
+@media (max-width: 640px) {
+  main {
+    min-height: calc(100vh - 116px);
+  }
+
+  .publication-header .hero-body {
+    padding-top: 3.5rem;
+  }
+
+  .publication-title {
+    margin-bottom: 1.75rem !important;
+  }
+
+  .publication-links {
+    gap: 0.55rem;
+  }
+
+  .publication-links .button {
+    height: 2.55rem;
+    padding: 0 1rem;
+    font-size: 0.9rem;
+  }
+}
+
