@@ -4599,6 +4599,7 @@ _via_file_annotator.prototype._creg_add = function(vid, mid) {
 }
 
 _via_file_annotator.prototype._creg_clear = function() {
+  if ( ! this.rshapectx || ! this.rshape_canvas ) return;
   this.rshapectx.clearRect(0, 0, this.rshape_canvas.width, this.rshape_canvas.height);
 }
 
@@ -5662,6 +5663,7 @@ _via_file_annotator.prototype._draw_control_point = function(ctx, cx, cy) {
 //
 _via_file_annotator.prototype._rinput_enable = function() {
   this._state_set(_VIA_RINPUT_STATE.IDLE);
+  if ( ! this.input ) return;
   this.input.style.pointerEvents = 'auto';
   this.input.classList.add('rinput_enabled');
   this.last_added_mid_list = [];
@@ -5677,6 +5679,7 @@ _via_file_annotator.prototype._rinput_enable = function() {
 
 _via_file_annotator.prototype._rinput_disable = function() {
   this._state_set(_VIA_RINPUT_STATE.SUSPEND);
+  if ( ! this.input ) return;
   this.input.style.pointerEvents = 'none';
   this.input.classList.remove('rinput_enabled');
   if ( this.d.store.file[this.fid].type === _VIA_FILE_TYPE.VIDEO ||
@@ -10707,10 +10710,10 @@ class MaskFrameCache {
     this.entries.set(index, value);
     return value;
   }
-  setTarget(index) {
+  setTarget(index, ahead = this.ahead) {
     this.target = index;
     this.wanted = index === null ? [] :
-      Array.from({length: Math.min(this.ahead + 1, this.maxFrame - index + 1)}, (_, offset) => index + offset);
+      Array.from({length: Math.min(ahead + 1, this.maxFrame - index + 1)}, (_, offset) => index + offset);
     this._pump();
   }
   _pump() {
@@ -10831,14 +10834,19 @@ function coloredLayer(decoded, color) {
 }
 
 class MaskOverlay {
-  constructor({canvas, view, maxFrame, loadFrame, onSelect = () => {},
+  constructor({canvas, video = null, view, maxFrame, loadFrame, onSelect = () => {},
     onStatus = () => {}, onEvidence = () => {}}) {
-    Object.assign(this, {canvas, view, maxFrame, onSelect, onStatus, onEvidence});
+    Object.assign(this, {canvas, video, view, maxFrame, onSelect, onStatus, onEvidence});
     this.context = canvas.getContext('2d');
+    this.buffer = document.createElement('canvas');
+    this.buffer.width = canvas.width;
+    this.buffer.height = canvas.height;
+    this.bufferContext = this.buffer.getContext('2d');
     this.index = null;
     this.evidence = null;
     this.items = [];
     this.labels = [];
+    this.playing = false;
     this.options = {segments: [], selectedId: null, opacity: 25, showMasks: true, interactive: true};
     this.destroyed = false;
     this.cache = new MaskFrameCache({
@@ -10889,7 +10897,13 @@ class MaskOverlay {
     this.evidence = next === null ? null : this.cache.get(next);
     this.onEvidence(this.evidence);
     this._draw();
-    this.cache.setTarget(next);
+    this.cache.setTarget(next, this.playing ? this.cache.ahead : 0);
+  }
+  setPlaying(playing) {
+    const next = !!playing;
+    if (this.destroyed || next === this.playing) return;
+    this.playing = next;
+    this.cache.setTarget(this.index, next ? this.cache.ahead : 0);
   }
   refresh(options = {}) {
     if (this.destroyed) return;
@@ -10908,24 +10922,36 @@ class MaskOverlay {
     return findMaskHit(this.items, this.labels, x, y, this.options.selectedId);
   }
   _draw() {
-    const context = this.context, canvas = this.canvas, evidence = this.evidence;
+    const displayContext = this.context, context = this.bufferContext;
+    const canvas = this.canvas, evidence = this.evidence;
     const {segments, selectedId, opacity, showMasks} = this.options;
-    context.clearRect(0, 0, canvas.width, canvas.height);
+    if (this.playing && this.index !== null && canvas.dataset.paintedFrame &&
+        (!evidence || evidence.source_frame_index !== this.index)) {
+      this.onStatus(`Frame ${this.index} · loading masks`);
+      return;
+    }
     this.items = [];
     this.labels = [];
     canvas.dataset.paintedFrame = '';
     if (this.index === null) {
+      displayContext.clearRect(0, 0, canvas.width, canvas.height);
       this.onStatus('Seeking…');
       return;
     }
     if (!evidence || evidence.source_frame_index !== this.index) {
+      displayContext.clearRect(0, 0, canvas.width, canvas.height);
       this.onStatus(`Frame ${this.index} · loading masks`);
       return;
     }
     const visible = visibleMaskSegments(segments, this.view, this.index, evidence);
     this.onStatus(`Frame ${this.index} · ${visible.length} masks${evidence.frame_missing ? ' · missing sample' : ''}` +
       (evidence.maskErrors.length ? ` · ${evidence.maskErrors.length} invalid masks` : ''));
-    if (!showMasks) return;
+    if (!showMasks) {
+      displayContext.clearRect(0, 0, canvas.width, canvas.height);
+      return;
+    }
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    if (this.video) context.drawImage(this.video, 0, 0, canvas.width, canvas.height);
     const scale = canvas.getBoundingClientRect().width / canvas.width || 1;
     const labels = [];
     visible.sort((a, b) => Number(a.segment_id === selectedId) - Number(b.segment_id === selectedId));
@@ -10974,6 +11000,10 @@ class MaskOverlay {
       this.labels.push({segment: label.segment, rect});
     }
     context.restore();
+    displayContext.save();
+    displayContext.globalCompositeOperation = 'copy';
+    displayContext.drawImage(this.buffer, 0, 0);
+    displayContext.restore();
     canvas.dataset.paintedFrame = String(this.index);
   }
   destroy() {
@@ -10986,6 +11016,9 @@ class MaskOverlay {
     this.items = [];
     this.labels = [];
     this.evidence = null;
+    this.video = null;
+    this.buffer.width = 0;
+    this.buffer.height = 0;
   }
 }
 
@@ -13018,7 +13051,8 @@ async function initialize() {
     proposalOverlays[view] = new ProposalMaskOverlay(proposalCanvas);
     samOverlays[view] = new SamOverlay(samCanvas, file.file_html_element,
       point => run(() => addMaskPoint(view, point))());
-    maskPlayers[view] = new MaskOverlay({canvas, view, maxFrame: meta.views[view].max_frame,
+    maskPlayers[view] = new MaskOverlay({canvas, video: file.file_html_element, view,
+      maxFrame: meta.views[view].max_frame,
       loadFrame: async index => (await api('/api/frame', null, {view, index})).json(),
       onSelect: id => run(() => selectFrameObject(view, id))(),
       onStatus: message => {
@@ -13037,8 +13071,14 @@ async function initialize() {
     });
     if (Number.isInteger(presentedFrames[view])) maskPlayers[view].setFrame(presentedFrames[view]);
     new ResizeObserver(() => requestAnimationFrame(drawMasks)).observe(file.c);
-    file.file_html_element.addEventListener('pause', () => { $('play').textContent = 'Play'; });
-    file.file_html_element.addEventListener('play', () => { $('play').textContent = 'Pause'; });
+    file.file_html_element.addEventListener('pause', () => {
+      maskPlayers[view].setPlaying(false);
+      $('play').textContent = 'Play';
+    });
+    file.file_html_element.addEventListener('play', () => {
+      maskPlayers[view].setPlaying(true);
+      $('play').textContent = 'Pause';
+    });
   }
   setLayout(Object.keys(meta.views).length > 1 ? 'both' : Object.keys(meta.views)[0]);
   workspace.seek(meta.first_observation_frame / meta.annotation_fps);
