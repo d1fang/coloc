@@ -1,1 +1,10 @@
+.env
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local files
 .DS_Store
+*.log
