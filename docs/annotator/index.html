@@ -11334,6 +11334,7 @@ const {clone} = __coloc_modules.m2;
 const VIEWS = ['leader', 'helper'];
 const JSON_TYPE = {type: 'application/json'};
 const CLIP_NAME = /^\d{4}-\d{4}$/;
+const STORAGE_PREFIX = 'coloc-corrections/v1:';
 const required = ['tracks.json', ...VIEWS.flatMap(view => [
   `${view}/segments.json`, `${view}/masks.jsonl`, `${view}/locations.jsonl`,
   `${view}_undistorted.mp4`,
@@ -11342,6 +11343,9 @@ const optional = ['tracks.corrected.json', ...VIEWS.flatMap(view => [
   `${view}/segments_update.json`, `${view}/segments_proposal.jsonl`,
   `${view}-segments_update.json`, `${view}-segments_proposal.jsonl`,
 ])];
+const agentFiles = new Set([
+  'tracks.corrected.json', 'leader/segments_update.json', 'helper/segments_update.json',
+]);
 
 function proposalMaskRows(requests, view) {
   const frames = new Map();
@@ -11362,6 +11366,36 @@ function serializeCorrection(path, value) {
   if (path.endsWith('.jsonl'))
     return value.map(row => JSON.stringify(row)).join('\n') + (value.length ? '\n' : '');
   return JSON.stringify(value, null, 2) + '\n';
+}
+
+function parseCorrection(path, text) {
+  if (!path.endsWith('.jsonl')) {
+    try { return JSON.parse(text); }
+    catch (error) { throw new Error(`${path}: ${error.message}`); }
+  }
+  return text.split(/\r?\n/).filter(line => line.trim()).map((line, index) => {
+    try { return JSON.parse(line); }
+    catch (error) { throw new Error(`${path}:${index + 1}: ${error.message}`); }
+  });
+}
+
+function agentCorrections(value) {
+  if (!value || Object.keys(value).sort().join() !==
+      ['documents', 'generated_at', 'schema_version', 'source_fingerprint'].join() ||
+      value.schema_version !== 'coloc-prereview/v1' ||
+      !/^[0-9a-f]{64}$/.test(value.source_fingerprint) ||
+      typeof value.generated_at !== 'string' || !Number.isFinite(Date.parse(value.generated_at)) ||
+      !value.documents ||
+      typeof value.documents !== 'object' || Array.isArray(value.documents))
+    throw new Error('agents.json does not follow the CoLoc prereview schema');
+  for (const [path, document] of Object.entries(value.documents)) {
+    if (!agentFiles.has(path)) throw new Error(`agents.json contains unsupported file ${path}`);
+    if (!document || typeof document !== 'object' || Array.isArray(document))
+      throw new Error(`agents.json: ${path} must be an object`);
+    if (path === 'tracks.corrected.json' && !Array.isArray(document.tracks))
+      throw new Error('agents.json: tracks.corrected.json must follow the tracks.json schema');
+  }
+  return clone(value.documents);
 }
 
 function median(values) {
@@ -11621,6 +11655,33 @@ class StaticRecording {
     catch (error) { throw new Error(`${path}: ${error.message}`); }
   }
 
+  storageKey() {
+    return `${STORAGE_PREFIX}${fingerprint(this.baseUrl)}:${this.label}`;
+  }
+  browserCorrections(sourceFingerprint) {
+    if (!this.baseUrl) return null;
+    try {
+      const saved = JSON.parse(localStorage.getItem(this.storageKey()));
+      if (saved?.source_fingerprint !== sourceFingerprint || !saved.documents ||
+          typeof saved.documents !== 'object' || Array.isArray(saved.documents)) return null;
+      return clone(saved);
+    } catch {
+      return null;
+    }
+  }
+  storeBrowserCorrections(project, sourceFingerprint, required = true) {
+    if (!this.baseUrl) return false;
+    const documents = Object.fromEntries(this.correctionFiles(project));
+    try {
+      localStorage.setItem(this.storageKey(), JSON.stringify({source_fingerprint: sourceFingerprint,
+        saved_at: project.saved_at, documents}));
+      return true;
+    } catch (error) {
+      if (required) throw new Error('Could not save corrections in this browser. Export the ZIP before closing this page.');
+      return false;
+    }
+  }
+
   async load(onProgress = () => {}) {
     onProgress('Loading tracks and segments…');
     const [sourceTrackDocument, ...segmentDocuments] = await Promise.all([
@@ -11635,14 +11696,31 @@ class StaticRecording {
       for (const [id, segment] of Object.entries(value)) validateSegment(segment, id, view);
       sourceSegments[view] = value;
     }
-    const correctionDocuments = {};
+    let correctionDocuments = {};
     for (const path of optional) {
-      if (!this.files?.has(path)) continue;
-      correctionDocuments[path] = path.endsWith('.jsonl') ?
-        (await this.text(path)).split(/\r?\n/).filter(line => line.trim()).map((line, index) => {
-          try { return JSON.parse(line); }
-          catch (error) { throw new Error(`${path}:${index + 1}: ${error.message}`); }
-        }) : await this.json(path);
+      if (this.files && !this.files.has(path)) continue;
+      if (!this.files) {
+        const response = await fetch(new URL(path, this.baseUrl));
+        if (response.status === 404) continue;
+        if (!response.ok) throw new Error(`Could not load ${path} (${response.status})`);
+        correctionDocuments[path] = parseCorrection(path, await response.text());
+      } else {
+        correctionDocuments[path] = parseCorrection(path, await this.text(path));
+      }
+    }
+    const sourceFingerprint = fingerprint(JSON.stringify([sourceTrackDocument, sourceSegments]));
+    const browserSaved = this.browserCorrections(sourceFingerprint);
+    let agentsLoaded = false;
+    if (browserSaved) {
+      correctionDocuments = browserSaved.documents;
+    } else if (!this.files) {
+      const response = await fetch(new URL('agents.json', this.baseUrl));
+      if (response.ok) {
+        correctionDocuments = agentCorrections(await response.json());
+        agentsLoaded = true;
+      } else if (response.status !== 404) {
+        throw new Error(`Could not load agents.json (${response.status})`);
+      }
     }
     const projectSegments = clone(sourceSegments);
     for (const view of VIEWS) {
@@ -11687,14 +11765,17 @@ class StaticRecording {
     if (correctedTrackDocument && !Array.isArray(correctedTrackDocument.tracks))
       throw new Error('tracks.corrected.json must follow the tracks.json schema');
     const effectiveTrackDocument = correctedTrackDocument || sourceTrackDocument;
-    const sourceFingerprint = fingerprint(JSON.stringify([sourceTrackDocument, sourceSegments]));
     const sourceById = new Map(VIEWS.flatMap(view => Object.entries(sourceSegments[view])));
     const initial = createProject(recordingId, projectSegments, effectiveTrackDocument.tracks, fps,
       new Set(sourceById.keys()));
     initial.source_fingerprint = sourceFingerprint;
     const project = applyCorrectionFiles(clone(initial), correctionDocuments);
     validateProject(project, {views, sourceById});
-    this.frames = frames; this.sourceById = sourceById; this.initial = clone(project); this.saved = clone(project);
+    this.frames = frames; this.sourceById = sourceById; this.sourceFingerprint = sourceFingerprint;
+    this.browserRestored = !!browserSaved;
+    this.agentsLoaded = agentsLoaded;
+    this.initial = clone(project); this.saved = clone(project);
+    const browserStored = this.storeBrowserCorrections(project, sourceFingerprint, false);
     this.meta = {dataset_id: recordingId, recording_id: recordingId, project_key: recordingId,
       projects: [{id: recordingId, label: recordingId}], views, annotation_fps: fps,
       duration: Math.max(...Object.values(views).map(view => view.duration)),
@@ -11706,7 +11787,8 @@ class StaticRecording {
       unassigned_count: initial.tracks.filter(track => track.origin === 'provisional').length,
       labels: [...new Set(initial.segments.map(segment => segment.label))].sort(),
       first_observation_frame: Math.min(...VIEWS.map(view => views[view].first_observation_frame)),
-      correction_path: this.directoryHandle ? 'clip correction files' : 'in-memory corrections',
+      correction_path: this.directoryHandle ? 'clip correction files' :
+        browserStored ? 'browser correction files' : 'in-memory corrections',
       export_directory: this.directoryHandle ? recordingId : 'browser downloads'};
     return {meta: this.meta, project};
   }
@@ -11732,8 +11814,9 @@ class StaticRecording {
         await writable.close();
       }
     }
+    const stored = this.storeBrowserCorrections(result, this.sourceFingerprint);
     this.saved = clone(result);
-    return {...result, written: !!this.directoryHandle};
+    return {...result, written: !!this.directoryHandle, stored};
   }
   savedProject() {
     return clone(this.saved);
@@ -12119,12 +12202,15 @@ function updateStatus() {
   $('save-status').textContent = saving ? 'Saving…' : samLoading ? 'Loading segmentation model…' :
     busy ? 'Validating…' :
     formDirty ? 'Unapplied form changes' : isDirty() ? 'Unsaved changes' :
-      baseRevision ? (recording?.directoryHandle ? 'Corrections saved to files' : 'Corrections saved in memory') :
-        'Loaded from clip files';
+      baseRevision ? (recording?.directoryHandle ? 'Corrections saved to files' :
+        recording?.baseUrl ? 'Corrections saved in this browser' : 'Corrections saved in memory') :
+        recording?.browserRestored ? 'Loaded saved browser corrections' :
+          recording?.agentsLoaded ? 'Initialized tracks' : 'Loaded from clip files';
   $('save-status').classList.toggle('dirty', formDirty || isDirty());
   $('save').disabled = locked;
   $('save').title = recording?.directoryHandle ? 'Write corrections into this recording folder' :
-    'Save in memory; use Export to download correction files';
+    recording?.baseUrl ? 'Save corrections in this browser' :
+      'Save in memory; use Export to download correction files';
   $('export').disabled = locked;
   $('playback-position').disabled = !reviewReady || locked || !!pendingPrompt;
   $('undo').disabled = !undo.length || locked || !!pendingPrompt;
@@ -12827,11 +12913,13 @@ async function save() {
     const snapshot = clone(project);
     const result = await (await api('/api/save', {project: snapshot, base_revision: baseRevision})).json();
     baseRevision = result.revision;
+    if (result.stored) recording.browserRestored = true;
     project.revision = result.revision;
     project.saved_at = result.saved_at;
     savedContent = contentKey(snapshot);
     toast(result.written ? 'Saved correction files in the recording folder.' :
-      'Corrections saved in memory. Use Export to download them.');
+      result.stored ? 'Corrections saved in this browser.' :
+        'Corrections saved in memory. Use Export to download them.');
   } finally {
     saving = false;
     updateStatus();
