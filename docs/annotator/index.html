@@ -704,6 +704,8 @@ dialog{width:470px;max-width:95vw;padding:16px;border:1px solid #555}dialog labe
     <span class="project-title">CoLoc Annotator</span>
     <span id="recording-name" class="recording-name hidden"></span>
     <button id="open-recording" class="hidden">Open recording</button>
+    <button id="load-initial-tracks" class="hidden">Load initial tracks</button>
+    <input id="initial-tracks-input" type="file" accept="application/json,.json" hidden>
     <div id="review-actions" class="header-actions hidden">
       <span id="save-status">Loading…</span><button id="undo" disabled>Undo</button>
       <button id="redo" disabled>Redo</button><button id="save" class="primary">Save corrections</button>
@@ -11612,7 +11614,7 @@ class StaticRecording {
         if (error.name !== 'NotFoundError') throw error;
       }
     };
-    await Promise.all([...required, ...optional].map(read));
+    await Promise.all([...required, ...optional, 'agents.json'].map(read));
     const missing = required.filter(path => !files.has(path));
     if (missing.length) throw new Error(`The selected clip is missing ${missing[0]}`);
     return new StaticRecording({files, directoryHandle, label: directoryHandle.name});
@@ -11657,13 +11659,13 @@ class StaticRecording {
     catch (error) { throw new Error(`${path}: ${error.message}`); }
   }
 
-  storageKey() {
-    return `${STORAGE_PREFIX}${fingerprint(this.baseUrl)}:${this.label}`;
+  storageKey(sourceFingerprint) {
+    const source = this.baseUrl ? fingerprint(this.baseUrl) : sourceFingerprint;
+    return `${STORAGE_PREFIX}${source}:${this.label}`;
   }
   browserCorrections(sourceFingerprint) {
-    if (!this.baseUrl) return null;
     try {
-      const saved = JSON.parse(localStorage.getItem(this.storageKey()));
+      const saved = JSON.parse(localStorage.getItem(this.storageKey(sourceFingerprint)));
       if (saved?.source_fingerprint !== sourceFingerprint || !saved.documents ||
           typeof saved.documents !== 'object' || Array.isArray(saved.documents)) return null;
       return clone(saved);
@@ -11672,10 +11674,9 @@ class StaticRecording {
     }
   }
   storeBrowserCorrections(project, sourceFingerprint, required = true) {
-    if (!this.baseUrl) return false;
     const documents = Object.fromEntries(this.correctionFiles(project));
     try {
-      localStorage.setItem(this.storageKey(), JSON.stringify({source_fingerprint: sourceFingerprint,
+      localStorage.setItem(this.storageKey(sourceFingerprint), JSON.stringify({source_fingerprint: sourceFingerprint,
         saved_at: project.saved_at, documents}));
       return true;
     } catch (error) {
@@ -11712,17 +11713,24 @@ class StaticRecording {
     }
     const sourceFingerprint = fingerprint(JSON.stringify([sourceTrackDocument, sourceSegments]));
     const browserSaved = this.browserCorrections(sourceFingerprint);
+    let agentDocuments = null;
     let agentsLoaded = false;
-    if (browserSaved) {
-      correctionDocuments = browserSaved.documents;
+    if (this.files?.has('agents.json')) {
+      agentDocuments = agentCorrections(await this.json('agents.json'));
     } else if (!this.files) {
       const response = await fetch(new URL('agents.json', this.baseUrl));
       if (response.ok) {
-        correctionDocuments = agentCorrections(await response.json());
-        agentsLoaded = true;
+        agentDocuments = agentCorrections(await response.json());
       } else if (response.status !== 404) {
         throw new Error(`Could not load agents.json (${response.status})`);
       }
+    }
+    const browserRestored = !!browserSaved?.saved_at || (!!browserSaved && !agentDocuments);
+    if (browserRestored) {
+      correctionDocuments = browserSaved.documents;
+    } else if (agentDocuments) {
+      correctionDocuments = agentDocuments;
+      agentsLoaded = true;
     }
     const projectSegments = clone(sourceSegments);
     for (const view of VIEWS) {
@@ -11774,7 +11782,8 @@ class StaticRecording {
     const project = applyCorrectionFiles(clone(initial), correctionDocuments);
     validateProject(project, {views, sourceById});
     this.frames = frames; this.sourceById = sourceById; this.sourceFingerprint = sourceFingerprint;
-    this.browserRestored = !!browserSaved;
+    this.sourceTrackDocument = clone(sourceTrackDocument); this.sourceSegments = clone(sourceSegments);
+    this.browserRestored = browserRestored;
     this.agentsLoaded = agentsLoaded;
     this.initial = clone(project); this.saved = clone(project);
     const browserStored = this.storeBrowserCorrections(project, sourceFingerprint, false);
@@ -11793,6 +11802,31 @@ class StaticRecording {
         browserStored ? 'browser correction files' : 'in-memory corrections',
       export_directory: this.directoryHandle ? recordingId : 'browser downloads'};
     return {meta: this.meta, project};
+  }
+
+  loadInitialTracks(value) {
+    const correctionDocuments = agentCorrections(value);
+    const projectSegments = clone(this.sourceSegments);
+    for (const view of VIEWS) {
+      const update = correctionDocuments[`${view}/segments_update.json`] || {};
+      for (const [id, patch] of Object.entries(update)) {
+        if (projectSegments[view][id]) continue;
+        validateSegment(patch, id, view);
+        projectSegments[view][id] = clone(patch);
+      }
+    }
+    const correctedTrackDocument = correctionDocuments['tracks.corrected.json'];
+    const effectiveTrackDocument = correctedTrackDocument || this.sourceTrackDocument;
+    const initial = createProject(this.meta.recording_id, projectSegments,
+      effectiveTrackDocument.tracks, this.meta.annotation_fps, new Set(this.sourceById.keys()));
+    initial.source_fingerprint = this.sourceFingerprint;
+    const project = applyCorrectionFiles(clone(initial), correctionDocuments);
+    validateProject(project, {views: this.meta.views, sourceById: this.sourceById});
+    project.saved_at = new Date().toISOString();
+    const stored = this.storeBrowserCorrections(project, this.sourceFingerprint);
+    this.initial = clone(project); this.saved = clone(project);
+    this.agentsLoaded = true; this.browserRestored = false;
+    return {project, stored};
   }
 
   frame(view, index) {
@@ -12179,7 +12213,8 @@ async function api(path, body, extra) {
   }
   if (path === '/api/save') {
     const saved = await recording.save(body.project, body.base_revision);
-    return jsonResponse({revision: saved.revision, saved_at: saved.saved_at, written: saved.written});
+    return jsonResponse({revision: saved.revision, saved_at: saved.saved_at,
+      written: saved.written, stored: saved.stored});
   }
   throw new Error(`Unsupported static operation: ${path}`);
 }
@@ -12206,14 +12241,14 @@ function updateStatus() {
     busy ? 'Validating…' :
     formDirty ? 'Unapplied form changes' : isDirty() ? 'Unsaved changes' :
       baseRevision ? (recording?.directoryHandle ? 'Corrections saved to files' :
-        recording?.baseUrl ? 'Corrections saved in this browser' : 'Corrections saved in memory') :
+        'Corrections saved in this browser') :
         recording?.browserRestored ? 'Loaded saved browser corrections' :
           recording?.agentsLoaded ? 'Initialized tracks' : 'Loaded from clip files';
   $('save-status').classList.toggle('dirty', formDirty || isDirty());
   $('save').disabled = locked;
+  $('load-initial-tracks').disabled = locked;
   $('save').title = recording?.directoryHandle ? 'Write corrections into this recording folder' :
-    recording?.baseUrl ? 'Save corrections in this browser' :
-      'Save in memory; use Export to download correction files';
+    'Save corrections in this browser';
   $('export').disabled = locked;
   $('playback-position').disabled = !reviewReady || locked || !!pendingPrompt;
   $('undo').disabled = !undo.length || locked || !!pendingPrompt;
@@ -12949,6 +12984,32 @@ async function exportCorrections() {
   download(zipDocuments([...sourceSegments, ...corrections]), `${folder}-corrections.zip`);
   toast('Downloaded corrections ZIP with leader and helper folders. No videos included.');
 }
+async function loadInitialTracks(file) {
+  await readyForEdit();
+  busy = true;
+  updateStatus();
+  try {
+    let value;
+    try { value = JSON.parse(await file.text()); }
+    catch (error) { throw new Error(`agents.json: ${error.message}`); }
+    const result = recording.loadInitialTracks(value);
+    project = result.project;
+    baseRevision = project.revision;
+    savedContent = contentKey(project);
+    undo = []; redo = []; batch.clear(); listedTrackId = null;
+    for (const editor of Object.values(editors)) editor.clearDirty();
+    reconcileSelections();
+    meta.labels = [...new Set(project.segments.map(segment => segment.label))].sort();
+    $('category-list').replaceChildren(...meta.labels.map(label => new Option(label)));
+    projectToVia();
+    renderAll();
+    toast(result.stored ? 'Loaded initial tracks and saved them in this browser.' :
+      'Loaded initial tracks in memory.');
+  } finally {
+    busy = false;
+    updateStatus();
+  }
+}
 async function undoRedo(direction) {
   await readyForEdit();
   const source = direction === 'undo' ? undo : redo, target = direction === 'undo' ? redo : undo;
@@ -13095,6 +13156,7 @@ async function initialize() {
   $('recording-name').title = meta.recording_id;
   $('recording-name').classList.remove('hidden');
   $('open-recording').classList.remove('hidden');
+  $('load-initial-tracks').classList.remove('hidden');
   $('category-list').replaceChildren(...meta.labels.map(label => new Option(label)));
   for (const view of Object.keys(meta.views)) {
     selectedByView[view] = null;
@@ -13207,7 +13269,8 @@ async function openRecording(next) {
     $('recording-start').classList.remove('hidden');
     $('recording-start-status').textContent = error.message;
     $('recording-start-status').classList.add('error-text');
-    for (const id of ['review-actions', 'review-workspace', 'recording-name', 'open-recording'])
+    for (const id of ['review-actions', 'review-workspace', 'recording-name', 'open-recording',
+      'load-initial-tracks'])
       $(id).classList.add('hidden');
     toast(error.message, true);
   }
@@ -13279,6 +13342,12 @@ $('open-recording').onclick = () => {
   workspace?.pause();
   location.href = new URL(location.pathname, location.href);
 };
+$('load-initial-tracks').onclick = () => $('initial-tracks-input').click();
+$('initial-tracks-input').onchange = run(async () => {
+  const file = $('initial-tracks-input').files[0];
+  $('initial-tracks-input').value = '';
+  if (file) await loadInitialTracks(file);
+});
 
 return {};
 })();
