@@ -731,6 +731,7 @@ dialog{width:470px;max-width:95vw;padding:16px;border:1px solid #555}dialog labe
       <label>View <select id="layout"><option value="both">Both</option><option value="leader">Leader</option><option value="helper">Helper</option></select></label>
       <label>Edit <select id="active-view"><option value="leader">Leader</option><option value="helper">Helper</option></select></label>
       <label><input id="show-masks" type="checkbox" checked> Masks</label>
+      <label><input id="ignore-people" type="checkbox" checked> Ignore people</label>
       <label>Opacity <input id="opacity" type="range" min="5" max="65" value="25"></label>
       <div id="sam-progress" class="sam-progress hidden" aria-live="polite"><progress max="1"></progress><span>Loading segmentation model…</span></div>
       <button id="shortcuts" title="Keyboard shortcuts" aria-label="Keyboard shortcuts">?</button>
@@ -10775,12 +10776,12 @@ function findMaskHit(items, labels, x, y, selectedId = null) {
 
 // Use the same frame evidence for the mask overlay and the current-object picker.
 // A segment's time range alone does not establish that it has a visible mask.
-function visibleMaskSegments(segments, view, index, evidence) {
+function visibleMaskSegments(segments, view, index, evidence, ignorePeople = false) {
   if (!Number.isInteger(index) || index < 0 ||
       evidence?.source_frame_index !== index || !evidence?.decoded) return [];
   return segments.filter(segment => {
     if (segment.view !== view || segment.rejected || segment.origin_result_id ||
-        !activeAt(segment, index)) return false;
+        (ignorePeople && segment.entity_type === 'person') || !activeAt(segment, index)) return false;
     const geometry = evidence.decoded.get(String(segment.object_id));
     return !!geometry && geometry.bbox[2] >= geometry.bbox[0] &&
       geometry.bbox[3] >= geometry.bbox[1];
@@ -10847,7 +10848,8 @@ class MaskOverlay {
     this.items = [];
     this.labels = [];
     this.playing = false;
-    this.options = {segments: [], selectedId: null, opacity: 25, showMasks: true, interactive: true};
+    this.options = {segments: [], selectedId: null, opacity: 25, showMasks: true,
+      ignorePeople: true, interactive: true};
     this.destroyed = false;
     this.cache = new MaskFrameCache({
       maxFrame, loadFrame,
@@ -10924,7 +10926,7 @@ class MaskOverlay {
   _draw() {
     const displayContext = this.context, context = this.bufferContext;
     const canvas = this.canvas, evidence = this.evidence;
-    const {segments, selectedId, opacity, showMasks} = this.options;
+    const {segments, selectedId, opacity, showMasks, ignorePeople} = this.options;
     if (this.playing && this.index !== null && canvas.dataset.paintedFrame &&
         (!evidence || evidence.source_frame_index !== this.index)) {
       this.onStatus(`Frame ${this.index} · loading masks`);
@@ -10943,7 +10945,7 @@ class MaskOverlay {
       this.onStatus(`Frame ${this.index} · loading masks`);
       return;
     }
-    const visible = visibleMaskSegments(segments, this.view, this.index, evidence);
+    const visible = visibleMaskSegments(segments, this.view, this.index, evidence, ignorePeople);
     this.onStatus(`Frame ${this.index} · ${visible.length} masks${evidence.frame_missing ? ' · missing sample' : ''}` +
       (evidence.maskErrors.length ? ` · ${evidence.maskErrors.length} invalid masks` : ''));
     if (!showMasks) {
@@ -12034,12 +12036,13 @@ class ProposalMaskOverlay {
     this.canvas = canvas;
     this.context = canvas.getContext('2d');
   }
-  render(requests, view, frameIndex, opacity = 25, visible = true) {
+  render(requests, view, frameIndex, opacity = 25, visible = true, ignorePeople = false) {
     const {canvas, context} = this;
     context.clearRect(0, 0, canvas.width, canvas.height);
     if (!visible) return;
     const image = context.createImageData(canvas.width, canvas.height);
-    for (const {prompt} of proposalMasksAt(requests, view, frameIndex)) {
+    for (const {request, prompt} of proposalMasksAt(requests, view, frameIndex)) {
+      if (ignorePeople && request.entity_type === 'person') continue;
       let decoded;
       try { decoded = decodeMask(prompt.mask); }
       catch { continue; }
@@ -12302,7 +12305,8 @@ async function selectSegment(id, seek = true) {
 async function selectFrameObject(view, id) {
   if (pendingPrompt || busy || saving) return;
   const index = presentedFrames[view];
-  if (!visibleMaskSegments(project.segments, view, index, frameData[view])
+  if (!visibleMaskSegments(project.segments, view, index, frameData[view],
+    $('ignore-people').checked)
     .some(segment => segment.segment_id === id)) {
     throw new Error('This object is no longer in the current frame. Pause and choose it again.');
   }
@@ -12527,9 +12531,11 @@ function renderFrameObjects(view) {
   if (!panel || !project || !meta) return;
   const index = presentedFrames[view], evidence = frameData[view];
   const loading = !Number.isInteger(index) || !evidence || evidence.source_frame_index !== index;
-  const objects = visibleMaskSegments(project.segments, view, index, evidence);
+  const ignorePeople = $('ignore-people').checked;
+  const objects = visibleMaskSegments(project.segments, view, index, evidence, ignorePeople);
   const proposals = project.requests.filter(request => request.kind === 'sam_mask' &&
     request.operation === 'create_segment' && request.view === view &&
+    (!ignorePeople || request.entity_type !== 'person') &&
     request.start_frame_index <= index && index <= request.end_frame_index);
   const draft = pendingPrompt?.kind === 'sam_mask' && pendingPrompt.phase === 'details' &&
     pendingPrompt.view === view ? editors[view]?.draft() : null;
@@ -12591,7 +12597,7 @@ function alignOverlays() {
 }
 function drawProposalMasks(view) {
   proposalOverlays[view]?.render(project.requests, view, presentedFrames[view],
-    Number($('opacity').value), $('show-masks').checked);
+    Number($('opacity').value), $('show-masks').checked, $('ignore-people').checked);
 }
 function drawMasks() {
   if (!workspace) return;
@@ -12600,6 +12606,7 @@ function drawMasks() {
     segments: project.segments.filter(segment => segment.view === view),
     selectedId: selectedByView[view], opacity: Number($('opacity').value),
     showMasks: $('show-masks').checked,
+    ignorePeople: $('ignore-people').checked,
     interactive: !pendingPrompt && !busy && !saving && !samLoading && !samInference,
   });
   for (const view of Object.keys(proposalOverlays)) drawProposalMasks(view);
@@ -12993,6 +13000,7 @@ function bind() {
   for (const button of document.querySelectorAll('[data-view].camera-select'))
     button.onclick = run(async () => { await readyForEdit(); workspace.setActiveView(button.dataset.view); });
   $('show-masks').onchange = drawMasks;
+  $('ignore-people').onchange = drawMasks;
   $('opacity').oninput = drawMasks;
   for (const id of ['search', 'view-filter', 'review-filter'])
     $(id).oninput = () => { rowLimit = 120; renderList(); };
@@ -13149,7 +13157,8 @@ async function initialize() {
         const masks = document.querySelector(`[data-visible-masks="${view}"]`);
         masks.classList.toggle('hidden', !match);
         if (match) {
-          const proposed = proposalMasksAt(project.requests, view, presentedFrames[view]).length;
+          const proposed = proposalMasksAt(project.requests, view, presentedFrames[view])
+            .filter(({request}) => !$('ignore-people').checked || request.entity_type !== 'person').length;
           masks.textContent = `${Number(match[2]) + proposed} masks`;
           $(`${view}-status`).textContent = `Frame ${match[1]}${match[3]}`;
         } else {
