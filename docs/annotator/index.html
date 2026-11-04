@@ -667,6 +667,7 @@ button,input,select,textarea { color:inherit; font:inherit; }
 button { padding:6px 10px; border:1px solid #b7bcc2; border-radius:5px; background:#fff; cursor:pointer; }
 button:hover:not(:disabled) { background:#f0f2f3; } button:disabled { opacity:.5; cursor:default; }
 .primary { border-color:#075f54; color:#fff; background:var(--accent); } .primary:hover:not(:disabled){background:#075248;}
+.initial-tracks-loaded{border-color:#4d8d68;color:#185c35;background:#e9f7ee}.initial-tracks-loaded:hover:not(:disabled){background:#dff2e6}
 .danger { color:#900; }.hidden,.hide,[hidden]{display:none!important}.help{color:var(--muted);font-size:12px}.error-text{color:#900}
 label{display:flex;flex-direction:column;gap:3px}input,select,textarea{padding:6px;border:1px solid #b7bcc2;border-radius:4px;background:#fff}
 h1,h2{margin:0;font-weight:normal}h1{font-size:20px}h2{font-size:16px}code{font-size:11px;color:#555}
@@ -10778,12 +10779,14 @@ function findMaskHit(items, labels, x, y, selectedId = null) {
 
 // Use the same frame evidence for the mask overlay and the current-object picker.
 // A segment's time range alone does not establish that it has a visible mask.
-function visibleMaskSegments(segments, view, index, evidence, ignorePeople = false) {
+function visibleMaskSegments(segments, view, index, evidence, ignorePeople = false,
+  personTrackIds = new Set()) {
   if (!Number.isInteger(index) || index < 0 ||
       evidence?.source_frame_index !== index || !evidence?.decoded) return [];
   return segments.filter(segment => {
     if (segment.view !== view || segment.rejected || segment.origin_result_id ||
-        (ignorePeople && segment.entity_type === 'person') || !activeAt(segment, index)) return false;
+        (ignorePeople && (segment.entity_type === 'person' || personTrackIds.has(segment.track_id))) ||
+        !activeAt(segment, index)) return false;
     const geometry = evidence.decoded.get(String(segment.object_id));
     return !!geometry && geometry.bbox[2] >= geometry.bbox[0] &&
       geometry.bbox[3] >= geometry.bbox[1];
@@ -10851,7 +10854,7 @@ class MaskOverlay {
     this.labels = [];
     this.playing = false;
     this.options = {segments: [], selectedId: null, opacity: 25, showMasks: true,
-      ignorePeople: true, interactive: true};
+      ignorePeople: true, personTrackIds: new Set(), interactive: true};
     this.destroyed = false;
     this.cache = new MaskFrameCache({
       maxFrame, loadFrame,
@@ -10928,7 +10931,7 @@ class MaskOverlay {
   _draw() {
     const displayContext = this.context, context = this.bufferContext;
     const canvas = this.canvas, evidence = this.evidence;
-    const {segments, selectedId, opacity, showMasks, ignorePeople} = this.options;
+    const {segments, selectedId, opacity, showMasks, ignorePeople, personTrackIds} = this.options;
     if (this.playing && this.index !== null && canvas.dataset.paintedFrame &&
         (!evidence || evidence.source_frame_index !== this.index)) {
       this.onStatus(`Frame ${this.index} · loading masks`);
@@ -10947,7 +10950,8 @@ class MaskOverlay {
       this.onStatus(`Frame ${this.index} · loading masks`);
       return;
     }
-    const visible = visibleMaskSegments(segments, this.view, this.index, evidence, ignorePeople);
+    const visible = visibleMaskSegments(segments, this.view, this.index, evidence, ignorePeople,
+      personTrackIds);
     this.onStatus(`Frame ${this.index} · ${visible.length} masks${evidence.frame_missing ? ' · missing sample' : ''}` +
       (evidence.maskErrors.length ? ` · ${evidence.maskErrors.length} invalid masks` : ''));
     if (!showMasks) {
@@ -11384,14 +11388,19 @@ function parseCorrection(path, text) {
 }
 
 function agentCorrections(value) {
-  if (!value || Object.keys(value).sort().join() !==
-      ['documents', 'generated_at', 'schema_version', 'source_fingerprint'].join() ||
-      value.schema_version !== 'coloc-prereview/v1' ||
-      !/^[0-9a-f]{64}$/.test(value.source_fingerprint) ||
-      typeof value.generated_at !== 'string' || !Number.isFinite(Date.parse(value.generated_at)) ||
-      !value.documents ||
-      typeof value.documents !== 'object' || Array.isArray(value.documents))
-    throw new Error('agents.json does not follow the CoLoc prereview schema');
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new Error('agents.json must contain a JSON object');
+  if (Object.keys(value).sort().join() !==
+      ['documents', 'generated_at', 'schema_version', 'source_fingerprint'].join())
+    throw new Error('agents.json contains missing or unsupported top-level fields');
+  if (value.schema_version !== 'coloc-prereview/v1')
+    throw new Error(`agents.json has unsupported schema_version ${value.schema_version}`);
+  if (!/^[0-9a-f]{64}$/.test(value.source_fingerprint))
+    throw new Error('agents.json source_fingerprint must be a 64-character lowercase SHA-256 value');
+  if (typeof value.generated_at !== 'string' || !Number.isFinite(Date.parse(value.generated_at)))
+    throw new Error('agents.json generated_at must be a valid date');
+  if (!value.documents || typeof value.documents !== 'object' || Array.isArray(value.documents))
+    throw new Error('agents.json documents must be an object');
   for (const [path, document] of Object.entries(value.documents)) {
     if (!agentFiles.has(path)) throw new Error(`agents.json contains unsupported file ${path}`);
     if (!document || typeof document !== 'object' || Array.isArray(document))
@@ -11677,7 +11686,8 @@ class StaticRecording {
     const documents = Object.fromEntries(this.correctionFiles(project));
     try {
       localStorage.setItem(this.storageKey(sourceFingerprint), JSON.stringify({source_fingerprint: sourceFingerprint,
-        saved_at: project.saved_at, documents}));
+        saved_at: project.saved_at, agents_loaded: this.agentsLoaded === true,
+        agent_source_fingerprint: this.agentSourceFingerprint || null, documents}));
       return true;
     } catch (error) {
       if (required) throw new Error('Could not save corrections in this browser. Export the ZIP before closing this page.');
@@ -11714,23 +11724,57 @@ class StaticRecording {
     const sourceFingerprint = fingerprint(JSON.stringify([sourceTrackDocument, sourceSegments]));
     const browserSaved = this.browserCorrections(sourceFingerprint);
     let agentDocuments = null;
+    let agentError = null;
+    let agentSourceFingerprint = null;
+    let agentLocation = null;
     let agentsLoaded = false;
-    if (this.files?.has('agents.json')) {
-      agentDocuments = agentCorrections(await this.json('agents.json'));
-    } else if (!this.files) {
-      const response = await fetch(new URL('agents.json', this.baseUrl));
-      if (response.ok) {
-        agentDocuments = agentCorrections(await response.json());
-      } else if (response.status !== 404) {
-        throw new Error(`Could not load agents.json (${response.status})`);
+    try {
+      let value = null;
+      if (this.files?.has('agents.json')) {
+        agentLocation = `${this.label}/agents.json`;
+        value = await this.json('agents.json');
+      } else if (!this.files) {
+        agentLocation = new URL('agents.json', this.baseUrl).href;
+        const response = await fetch(agentLocation);
+        if (response.ok) {
+          value = await response.json();
+        } else if (response.status === 404) {
+          agentError = new Error(`agents.json was not found (${response.status})`);
+          console.warn('[CoLoc agents] Automatic load did not find agents.json', {
+            url: agentLocation, status: response.status,
+          });
+        } else {
+          throw new Error(`Could not load agents.json (${response.status})`);
+        }
       }
+      if (value) {
+        agentDocuments = agentCorrections(value);
+        agentSourceFingerprint = value.source_fingerprint;
+      }
+    } catch (error) {
+      agentError = error;
+      console.error('[CoLoc agents] Automatic agents.json load failed', {
+        location: agentLocation, clip_storage_fingerprint: sourceFingerprint,
+      }, error);
     }
     const browserRestored = !!browserSaved?.saved_at || (!!browserSaved && !agentDocuments);
     if (browserRestored) {
       correctionDocuments = browserSaved.documents;
+      agentsLoaded = browserSaved.agents_loaded === true;
+      agentSourceFingerprint = browserSaved.agent_source_fingerprint || null;
     } else if (agentDocuments) {
       correctionDocuments = agentDocuments;
       agentsLoaded = true;
+    }
+    if (agentsLoaded) {
+      console.info('[CoLoc agents] Initial tracks loaded', {
+        location: agentLocation, agent_source_fingerprint: agentSourceFingerprint,
+        clip_storage_fingerprint: sourceFingerprint,
+      });
+    } else if (agentDocuments && browserRestored) {
+      console.info('[CoLoc agents] Saved browser corrections take priority over agents.json', {
+        location: agentLocation, agent_source_fingerprint: agentSourceFingerprint,
+      });
     }
     const projectSegments = clone(sourceSegments);
     for (const view of VIEWS) {
@@ -11785,6 +11829,8 @@ class StaticRecording {
     this.sourceTrackDocument = clone(sourceTrackDocument); this.sourceSegments = clone(sourceSegments);
     this.browserRestored = browserRestored;
     this.agentsLoaded = agentsLoaded;
+    this.agentsError = agentError;
+    this.agentSourceFingerprint = agentSourceFingerprint;
     this.initial = clone(project); this.saved = clone(project);
     const browserStored = this.storeBrowserCorrections(project, sourceFingerprint, false);
     this.meta = {dataset_id: recordingId, recording_id: recordingId, project_key: recordingId,
@@ -11823,9 +11869,14 @@ class StaticRecording {
     const project = applyCorrectionFiles(clone(initial), correctionDocuments);
     validateProject(project, {views: this.meta.views, sourceById: this.sourceById});
     project.saved_at = new Date().toISOString();
+    this.agentsLoaded = true; this.browserRestored = false;
+    this.agentsError = null; this.agentSourceFingerprint = value.source_fingerprint;
     const stored = this.storeBrowserCorrections(project, this.sourceFingerprint);
     this.initial = clone(project); this.saved = clone(project);
-    this.agentsLoaded = true; this.browserRestored = false;
+    console.info('[CoLoc agents] Manually loaded initial tracks', {
+      file: 'agents.json', agent_source_fingerprint: this.agentSourceFingerprint,
+      clip_storage_fingerprint: this.sourceFingerprint,
+    });
     return {project, stored};
   }
 
@@ -12070,13 +12121,15 @@ class ProposalMaskOverlay {
     this.canvas = canvas;
     this.context = canvas.getContext('2d');
   }
-  render(requests, view, frameIndex, opacity = 25, visible = true, ignorePeople = false) {
+  render(requests, view, frameIndex, opacity = 25, visible = true, ignorePeople = false,
+    personTrackIds = new Set()) {
     const {canvas, context} = this;
     context.clearRect(0, 0, canvas.width, canvas.height);
     if (!visible) return;
     const image = context.createImageData(canvas.width, canvas.height);
     for (const {request, prompt} of proposalMasksAt(requests, view, frameIndex)) {
-      if (ignorePeople && request.entity_type === 'person') continue;
+      if (ignorePeople &&
+          (request.entity_type === 'person' || personTrackIds.has(request.track_id))) continue;
       let decoded;
       try { decoded = decodeMask(prompt.mask); }
       catch { continue; }
@@ -12195,6 +12248,10 @@ const selectedByView = {}, presentedFrames = {};
 const frameChoiceKeys = {};
 let projectKey = new URL(location.href).searchParams.get('project') || '';
 const proposalId = request => request.request_id || request.segment_id;
+const personTrackIds = () => new Set(project.tracks
+  .filter(track => track.label.trim().toLowerCase() === 'person')
+  .map(track => track.track_id));
+const isPerson = (item, trackIds) => item.entity_type === 'person' || trackIds.has(item.track_id);
 
 function scopedURL(path, extra = {}) {
   const url = new URL(path, location.href);
@@ -12224,6 +12281,17 @@ function contentKey(value) {
 }
 const isDirty = () => project && contentKey(project) !== savedContent;
 const current = () => segmentById(project, selected);
+function updateInitialTracksControl() {
+  const button = $('load-initial-tracks');
+  const loaded = recording?.agentsLoaded === true;
+  button.classList.toggle('initial-tracks-loaded', loaded);
+  button.textContent = loaded ? '✓ Initial tracks loaded' : 'Load initial tracks';
+  button.title = loaded ?
+    `Agent prereview loaded${recording.agentSourceFingerprint ? ` · ${recording.agentSourceFingerprint}` : ''}` :
+    recording?.agentsError ?
+      `Automatic load failed: ${recording.agentsError.message}. Choose an agents.json file.` :
+      'Choose an agents.json file';
+}
 function toast(message, error = false) {
   clearTimeout(toastTimer);
   $('toast').textContent = message;
@@ -12247,6 +12315,7 @@ function updateStatus() {
   $('save-status').classList.toggle('dirty', formDirty || isDirty());
   $('save').disabled = locked;
   $('load-initial-tracks').disabled = locked;
+  updateInitialTracksControl();
   $('save').title = recording?.directoryHandle ? 'Write corrections into this recording folder' :
     'Save corrections in this browser';
   $('export').disabled = locked;
@@ -12341,7 +12410,7 @@ async function selectFrameObject(view, id) {
   if (pendingPrompt || busy || saving) return;
   const index = presentedFrames[view];
   if (!visibleMaskSegments(project.segments, view, index, frameData[view],
-    $('ignore-people').checked)
+    $('ignore-people').checked, personTrackIds())
     .some(segment => segment.segment_id === id)) {
     throw new Error('This object is no longer in the current frame. Pause and choose it again.');
   }
@@ -12567,10 +12636,11 @@ function renderFrameObjects(view) {
   const index = presentedFrames[view], evidence = frameData[view];
   const loading = !Number.isInteger(index) || !evidence || evidence.source_frame_index !== index;
   const ignorePeople = $('ignore-people').checked;
-  const objects = visibleMaskSegments(project.segments, view, index, evidence, ignorePeople);
+  const people = personTrackIds();
+  const objects = visibleMaskSegments(project.segments, view, index, evidence, ignorePeople, people);
   const proposals = project.requests.filter(request => request.kind === 'sam_mask' &&
     request.operation === 'create_segment' && request.view === view &&
-    (!ignorePeople || request.entity_type !== 'person') &&
+    (!ignorePeople || !isPerson(request, people)) &&
     request.start_frame_index <= index && index <= request.end_frame_index);
   const draft = pendingPrompt?.kind === 'sam_mask' && pendingPrompt.phase === 'details' &&
     pendingPrompt.view === view ? editors[view]?.draft() : null;
@@ -12632,16 +12702,19 @@ function alignOverlays() {
 }
 function drawProposalMasks(view) {
   proposalOverlays[view]?.render(project.requests, view, presentedFrames[view],
-    Number($('opacity').value), $('show-masks').checked, $('ignore-people').checked);
+    Number($('opacity').value), $('show-masks').checked, $('ignore-people').checked,
+    personTrackIds());
 }
 function drawMasks() {
   if (!workspace) return;
   alignOverlays();
+  const people = personTrackIds();
   for (const [view, player] of Object.entries(maskPlayers)) player.refresh({
     segments: project.segments.filter(segment => segment.view === view),
     selectedId: selectedByView[view], opacity: Number($('opacity').value),
     showMasks: $('show-masks').checked,
     ignorePeople: $('ignore-people').checked,
+    personTrackIds: people,
     interactive: !pendingPrompt && !busy && !saving && !samLoading && !samInference,
   });
   for (const view of Object.keys(proposalOverlays)) drawProposalMasks(view);
@@ -12988,8 +13061,8 @@ async function loadInitialTracks(file) {
   await readyForEdit();
   busy = true;
   updateStatus();
+  let value;
   try {
-    let value;
     try { value = JSON.parse(await file.text()); }
     catch (error) { throw new Error(`agents.json: ${error.message}`); }
     const result = recording.loadInitialTracks(value);
@@ -13005,6 +13078,13 @@ async function loadInitialTracks(file) {
     renderAll();
     toast(result.stored ? 'Loaded initial tracks and saved them in this browser.' :
       'Loaded initial tracks in memory.');
+  } catch (error) {
+    console.error('[CoLoc agents] Manual agents.json load failed', {
+      recording_id: meta?.recording_id, file: file.name,
+      agent_source_fingerprint: value?.source_fingerprint || null,
+      clip_storage_fingerprint: recording?.sourceFingerprint || null,
+    }, error);
+    throw error;
   } finally {
     busy = false;
     updateStatus();
@@ -13219,8 +13299,9 @@ async function initialize() {
         const masks = document.querySelector(`[data-visible-masks="${view}"]`);
         masks.classList.toggle('hidden', !match);
         if (match) {
+          const people = personTrackIds();
           const proposed = proposalMasksAt(project.requests, view, presentedFrames[view])
-            .filter(({request}) => !$('ignore-people').checked || request.entity_type !== 'person').length;
+            .filter(({request}) => !$('ignore-people').checked || !isPerson(request, people)).length;
           masks.textContent = `${Number(match[2]) + proposed} masks`;
           $(`${view}-status`).textContent = `Frame ${match[1]}${match[3]}`;
         } else {
