@@ -705,7 +705,7 @@ dialog{width:470px;max-width:95vw;padding:16px;border:1px solid #555}dialog labe
     <span class="project-title">CoLoc Annotator</span>
     <span id="recording-name" class="recording-name hidden"></span>
     <button id="open-recording" class="hidden">Open recording</button>
-    <button id="load-initial-tracks" class="hidden">Load initial tracks</button>
+    <button id="load-initial-tracks" class="hidden">Load tracks</button>
     <input id="initial-tracks-input" type="file" accept="application/json,.json" hidden>
     <div id="review-actions" class="header-actions hidden">
       <span id="save-status">Loading…</span><button id="undo" disabled>Undo</button>
@@ -780,7 +780,7 @@ dialog{width:470px;max-width:95vw;padding:16px;border:1px solid #555}dialog labe
   </section></main>
   <template id="segment-editor-template">
     <div class="editor-heading"><h2 data-field="heading"></h2><span data-field="state" class="editor-state"></span></div><div data-field="empty" class="editor-empty">Choose an object, mask, or timeline segment.</div>
-    <div data-field="body" hidden><div class="editor-selection"><div class="editor-selection-title"><strong data-field="selection-label"></strong><code data-field="segment-id"></code><span data-field="frame-context" class="visibility-badge"></span></div><div data-field="quick-actions" class="editor-quick-actions"><button data-action="mask" type="button">Fix mask</button><button data-action="split" type="button">Split here</button><button data-action="reject" type="button" class="danger">Reject detection</button></div></div>
+    <div data-field="body" hidden><div class="editor-selection"><div class="editor-selection-title"><strong data-field="selection-label"></strong><code data-field="segment-id"></code><span data-field="frame-context" class="visibility-badge"></span></div><div data-field="quick-actions" class="editor-quick-actions"><button data-action="mask" type="button" hidden>Fix mask</button><button data-action="split" type="button">Split here</button><button data-action="reject" type="button" class="danger">Reject detection</button></div></div>
       <form data-field="form" class="compact-segment-form"><div data-field="track-row" class="editor-track"><span>Identity</span><div><code data-field="track-id"></code><button data-action="new-track" type="button">New track</button><button data-action="link" type="button">Link track</button></div></div>
         <div class="two-fields"><div data-field="category-field" class="category-field"><label data-field="category-label">Category</label><div class="category-input"><input data-field="category" required maxlength="200"><button data-field="category-toggle" type="button" aria-haspopup="dialog" aria-expanded="false">Browse</button></div><div data-field="category-picker" class="category-picker" role="dialog" aria-label="Category hierarchy" hidden><div class="category-picker-header"><div data-field="category-person"></div><input data-field="category-search" class="category-search" type="search" placeholder="Search labels…" aria-label="Search category labels"></div><div data-field="category-groups" class="category-groups"></div></div></div><label>Entity type<select data-field="entity"><option value="object">Object</option><option value="person">Person</option><option value="unknown">Unknown</option></select></label></div>
         <div class="two-fields"><label>Start (s)<input data-field="start" type="number" min="0" required></label><label>End (s)<input data-field="end" type="number" min="0" required></label></div>
@@ -9436,9 +9436,10 @@ function visibleTimelineGroups(metadata, groups, start, end, anchor) {
 class ViaWorkspace {
   constructor({panes, timelinePanes = {}, fullTimelineHost = null, data, fps = 5, onChange = noop, onSelect = noop,
     onTime = noop, onFrame = noop, onReady = noop, onError = noop, onActiveView = noop,
+    onPlaybackState = noop,
     canPlayShortcut = () => true}) {
     Object.assign(this, {panes, timelinePanes, fullTimelineHost, data, fps, onChange, onSelect, onTime, onReady,
-      onFrame, onError, onActiveView, canPlayShortcut});
+      onFrame, onError, onActiveView, onPlaybackState, canPlayShortcut});
     this.id = `coloc-workspace-${++workspaceSequence}`;
     this.annotators = {};
     this.fileAnnotators = {};
@@ -9452,6 +9453,7 @@ class ViaWorkspace {
     this._frameStates = new Map();
     this._wantedPlaying = false;
     this._buffering = false;
+    this._playbackState = '';
     this._destroyed = false;
     this._silentSelection = false;
     this._lastReportedFrame = -1;
@@ -9787,18 +9789,26 @@ class ViaWorkspace {
   _wireMedia(view, video) {
     this._watchVideoFrames(view, video);
     this._listen(video, 'play', () => {
-      if (this._destroyed || this._buffering) return;
+      if (this._destroyed) return;
+      if (this._buffering) {
+        video.pause();
+        return;
+      }
       if (this.drawingView) {
         this.pause();
         this.onError('Finish or cancel the current proposal before playback.');
         return;
       }
-      this._wantedPlaying = true;
-      this._alignTime(video.currentTime, view);
+      if (!this._wantedPlaying) {
+        this._wantedPlaying = true;
+        this._alignTime(video.currentTime, view);
+        this._notifyPlaybackState();
+      }
       this._playAll();
     });
     this._listen(video, 'pause', () => {
-      if (this._wantedPlaying && !this._buffering && !video.ended) this.pause();
+      if (this._wantedPlaying && !this._buffering && !video.ended)
+        queueMicrotask(() => this._playAll());
     });
     this._listen(video, 'ended', () => this.pause());
     this._listen(video, 'seeking', () => {
@@ -9823,17 +9833,37 @@ class ViaWorkspace {
     });
     this._listen(video, 'ratechange', () => this.setRate(video.playbackRate));
     this._listen(video, 'waiting', () => {
-      if (!this._wantedPlaying) return;
+      if (!this._wantedPlaying || this._buffering) return;
       this._buffering = true;
+      this._notifyPlaybackState();
       for (const media of Object.values(this.videos)) media.pause();
     });
     this._listen(video, 'canplay', () => {
       if (this._buffering && this._wantedPlaying &&
           Object.values(this.videos).every(media => media.readyState >= 3)) {
         this._buffering = false;
+        this._alignTime(this.videos[this.activeView].currentTime, this.activeView);
+        this._notifyPlaybackState();
         this._playAll();
       }
     });
+    this._listen(video, 'error', () => {
+      if (this._destroyed || !video.error) return;
+      const kinds = {1: 'aborted', 2: 'network error', 3: 'decode error', 4: 'unsupported source'};
+      console.error('[CoLoc playback] Video failed', {
+        view, kind: kinds[video.error.code] || 'unknown error', message: video.error.message,
+        source: video.currentSrc, network_state: video.networkState, ready_state: video.readyState,
+      });
+      this.pause();
+      this.onError(`${view} video stopped: ${kinds[video.error.code] || 'media error'}`);
+    });
+  }
+
+  _notifyPlaybackState() {
+    const state = !this._wantedPlaying ? 'paused' : this._buffering ? 'buffering' : 'playing';
+    if (state === this._playbackState) return;
+    this._playbackState = state;
+    this.onPlaybackState({state, playing: this._wantedPlaying, buffering: this._buffering});
   }
 
   // onFrame(view, frameIndex, mediaTime) follows each video's presented frame,
@@ -9926,9 +9956,13 @@ class ViaWorkspace {
 
   _playAll() {
     if (!this._wantedPlaying || this._buffering) return;
-    for (const video of Object.values(this.videos)) {
+    for (const [view, video] of Object.entries(this.videos)) {
       if (video.paused) video.play().catch(error => {
         if (this._wantedPlaying && !this._buffering && error.name !== 'AbortError') {
+          console.error('[CoLoc playback] Video could not start', {
+            view, source: video.currentSrc, network_state: video.networkState,
+            ready_state: video.readyState,
+          }, error);
           this.pause();
           this.onError(`Playback could not start: ${error.message}`);
         }
@@ -9950,9 +9984,10 @@ class ViaWorkspace {
     if (this._destroyed) return;
     const master = this.videos[this.activeView];
     if (master && this._wantedPlaying && !this._buffering && !master.seeking) {
+      const maximumDrift = Math.max(0.25, 1 / this.fps);
       for (const [view, video] of Object.entries(this.videos)) {
         if (view !== this.activeView && !video.seeking &&
-            Math.abs(video.currentTime - master.currentTime) > 0.08) {
+            Math.abs(video.currentTime - master.currentTime) > maximumDrift) {
           this._seekVideo(view, Math.min(master.currentTime, video.duration));
         }
       }
@@ -9994,12 +10029,14 @@ class ViaWorkspace {
     this._wantedPlaying = true;
     this._buffering = false;
     this._alignTime(this.videos[this.activeView].currentTime, this.activeView);
+    this._notifyPlaybackState();
     this._playAll();
   }
 
   pause() {
     this._wantedPlaying = false;
     this._buffering = false;
+    this._notifyPlaybackState();
     for (const video of Object.values(this.videos)) video.pause();
   }
 
@@ -11349,7 +11386,6 @@ const required = ['tracks.json', ...VIEWS.flatMap(view => [
 ])];
 const optional = ['tracks.corrected.json', ...VIEWS.flatMap(view => [
   `${view}/segments_update.json`, `${view}/segments_proposal.jsonl`,
-  `${view}-segments_update.json`, `${view}-segments_proposal.jsonl`,
 ])];
 const agentFiles = new Set([
   'tracks.corrected.json', 'leader/segments_update.json', 'helper/segments_update.json',
@@ -11543,7 +11579,7 @@ function corrections(project, sourceById) {
       if (original) patch.source_segment_id = original.segment_id;
     }
     if (segment.rejected) patch.rejected = true;
-    const issues = (segment.issues || []).filter(issue => !['false_detection', 'bad_mask'].includes(issue));
+    const issues = (segment.issues || []).filter(issue => issue !== 'false_detection');
     if (issues.length) patch.issues = issues;
     if (segment.notes?.trim()) patch.notes = segment.notes.trim();
     if (Object.keys(patch).length) updates[segment.view][segment.segment_id] = patch;
@@ -12233,12 +12269,12 @@ const element = (tag, className = '', text = '') => {
   return node;
 };
 const issues = {
-  identity_uncertain: 'Uncertain identity', missing_position: 'Missing 3D', other: 'Other',
+  identity_uncertain: 'Uncertain identity', bad_mask: 'Bad mask', merged_mask: 'Merged mask', other: 'Other',
 };
 let meta, project, data, workspace, selected, baseRevision = 0, savedContent = '', reviewReady = false;
 let recording;
 let formDirty = false, busy = false, saving = false, samLoading = false, samInference = false;
-let frame = -1, time = 0, slimSam;
+let frame = -1, time = 0, playbackBuffering = false, slimSam;
 let undo = [], redo = [], pendingPrompt = null;
 let rowLimit = 120, toastTimer;
 let listedTrackId = null, trackListFilter = 'all';
@@ -12285,7 +12321,7 @@ function updateInitialTracksControl() {
   const button = $('load-initial-tracks');
   const loaded = recording?.agentsLoaded === true;
   button.classList.toggle('initial-tracks-loaded', loaded);
-  button.textContent = loaded ? '✓ Initial tracks loaded' : 'Load initial tracks';
+  button.textContent = loaded ? 'Tracks loaded' : 'Load tracks';
   button.title = loaded ?
     `Agent prereview loaded${recording.agentSourceFingerprint ? ` · ${recording.agentSourceFingerprint}` : ''}` :
     recording?.agentsError ?
@@ -12608,15 +12644,20 @@ function renderAll() {
 function timeChanged(seconds) {
   time = seconds;
   const next = Math.min(meta.max_frame, Math.max(0, Math.floor(seconds * meta.annotation_fps + 0.00001)));
-  $('play').textContent = workspace?._wantedPlaying ? 'Pause' : 'Play';
   $('playback-position').value = next;
   const currentTime = formatTime(next / meta.annotation_fps);
   const endTime = formatTime(meta.max_frame / meta.annotation_fps);
-  $('playback-time').textContent = `${currentTime} / ${endTime}`;
+  $('playback-time').textContent = playbackBuffering ? `Loading… / ${endTime}` : `${currentTime} / ${endTime}`;
   $('playback-position').setAttribute('aria-valuetext', `${currentTime} of ${endTime}`);
   if (next === frame) return;
   frame = next;
   if ($('review-filter').value === 'current') renderList();
+}
+function playbackStateChanged({playing, buffering}) {
+  playbackBuffering = buffering;
+  $('play').textContent = playing ? 'Pause' : 'Play';
+  timeChanged(time);
+  for (const player of Object.values(maskPlayers)) player.setPlaying(playing && !buffering);
 }
 function presentedFrame(view, index) {
   presentedFrames[view] = index;
@@ -13119,13 +13160,11 @@ function bind() {
     if (pendingPrompt?.kind === 'sam_mask') cancelProposal();
     else if (pendingPrompt) return toast('Finish the current proposal before playback', true);
     workspace.playPause();
-    $('play').textContent = workspace._wantedPlaying ? 'Pause' : 'Play';
   };
   const seek = seconds => {
     if (pendingPrompt?.kind === 'sam_mask') cancelProposal();
     else if (pendingPrompt) return toast('Finish the current proposal before seeking', true);
     workspace.seek(Math.max(0, Math.min(Number(seconds) || 0, meta.max_frame / meta.annotation_fps)));
-    $('play').textContent = 'Play';
   };
   $('previous-frame').onclick = () => seek((frame - 1) / meta.annotation_fps);
   $('next-frame').onclick = () => seek((frame + 1) / meta.annotation_fps);
@@ -13270,6 +13309,7 @@ async function initialize() {
     canPlayShortcut: () => reviewReady && !busy && !saving && !samLoading && !samInference && !pendingPrompt,
     onChange: nativeChange, onSelect: (id) => run(() => selectSegment(id, false))(),
     onTime: timeChanged, onFrame: presentedFrame,
+    onPlaybackState: playbackStateChanged,
     onActiveView: activeViewChanged, onError: message => toast(message, true),
   });
   $('recording-start').classList.add('hidden');
@@ -13310,16 +13350,9 @@ async function initialize() {
       },
       onEvidence: evidence => { frameData[view] = evidence; renderFrameObjects(view); },
     });
+    maskPlayers[view].setPlaying(workspace._wantedPlaying);
     if (Number.isInteger(presentedFrames[view])) maskPlayers[view].setFrame(presentedFrames[view]);
     new ResizeObserver(() => requestAnimationFrame(drawMasks)).observe(file.c);
-    file.file_html_element.addEventListener('pause', () => {
-      maskPlayers[view].setPlaying(false);
-      $('play').textContent = 'Play';
-    });
-    file.file_html_element.addEventListener('play', () => {
-      maskPlayers[view].setPlaying(true);
-      $('play').textContent = 'Pause';
-    });
   }
   setLayout(Object.keys(meta.views).length > 1 ? 'both' : Object.keys(meta.views)[0]);
   workspace.seek(meta.first_observation_frame / meta.annotation_fps);
