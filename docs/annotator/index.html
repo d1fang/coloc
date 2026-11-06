@@ -667,7 +667,6 @@ button,input,select,textarea { color:inherit; font:inherit; }
 button { padding:6px 10px; border:1px solid #b7bcc2; border-radius:5px; background:#fff; cursor:pointer; }
 button:hover:not(:disabled) { background:#f0f2f3; } button:disabled { opacity:.5; cursor:default; }
 .primary { border-color:#075f54; color:#fff; background:var(--accent); } .primary:hover:not(:disabled){background:#075248;}
-.initial-tracks-loaded{border-color:#4d8d68;color:#185c35;background:#e9f7ee}.initial-tracks-loaded:hover:not(:disabled){background:#dff2e6}
 .danger { color:#900; }.hidden,.hide,[hidden]{display:none!important}.help{color:var(--muted);font-size:12px}.error-text{color:#900}
 label{display:flex;flex-direction:column;gap:3px}input,select,textarea{padding:6px;border:1px solid #b7bcc2;border-radius:4px;background:#fff}
 h1,h2{margin:0;font-weight:normal}h1{font-size:20px}h2{font-size:16px}code{font-size:11px;color:#555}
@@ -705,8 +704,8 @@ dialog{width:470px;max-width:95vw;padding:16px;border:1px solid #555}dialog labe
     <span class="project-title">CoLoc Annotator</span>
     <span id="recording-name" class="recording-name hidden"></span>
     <button id="open-recording" class="hidden">Open recording</button>
-    <button id="load-initial-tracks" class="hidden">Load tracks</button>
-    <input id="initial-tracks-input" type="file" accept="application/json,.json" hidden>
+    <button id="load-zipped-tracks" class="hidden">Load zipped tracks</button>
+    <input id="tracks-zip-input" type="file" accept=".zip,application/zip" hidden>
     <div id="review-actions" class="header-actions hidden">
       <span id="save-status">Loading…</span><button id="undo" disabled>Undo</button>
       <button id="redo" disabled>Redo</button><button id="save" class="primary">Save corrections</button>
@@ -10742,6 +10741,7 @@ class MaskFrameCache {
     this.pending = new Set();
     this.wanted = [];
     this.target = null;
+    this.generation = 0;
     this.destroyed = false;
   }
   get(index) {
@@ -10762,9 +10762,10 @@ class MaskFrameCache {
     for (const index of this.wanted) {
       if (this.pending.size >= this.concurrency) break;
       if (this.entries.has(index) || this.pending.has(index)) continue;
+      const generation = this.generation;
       this.pending.add(index);
       Promise.resolve().then(() => this.loadFrame(index)).then(evidence => {
-        if (this.destroyed || !this.wanted.includes(index)) return;
+        if (this.destroyed || generation !== this.generation || !this.wanted.includes(index)) return;
         if (evidence.source_frame_index !== index)
           throw new Error(`Expected sample ${index}, received ${evidence.source_frame_index}`);
         const prepared = this.prepare(evidence);
@@ -10775,15 +10776,23 @@ class MaskFrameCache {
         }
         if (index === this.target) this.onReady(prepared, index);
       }).catch(error => {
+        if (generation !== this.generation) return;
         // Do not retry failed prefetches in a tight loop. A later frame change
         // may request the failed sample again.
         this.wanted = this.wanted.filter(value => value !== index);
         if (!this.destroyed && index === this.target) this.onError(error, index);
       }).finally(() => {
+        if (generation !== this.generation) return;
         this.pending.delete(index);
         this._pump();
       });
     }
+  }
+  invalidate() {
+    this.generation++;
+    this.entries.clear();
+    this.pending.clear();
+    this._pump();
   }
   destroy() {
     this.destroyed = true;
@@ -10954,6 +10963,13 @@ class MaskOverlay {
     Object.assign(this.options, options);
     this.canvas.style.pointerEvents = this.options.interactive && this.options.showMasks ? 'auto' : 'none';
     this.canvas.style.cursor = this.options.interactive && this.options.showMasks ? 'pointer' : '';
+    this._draw();
+  }
+  invalidate() {
+    if (this.destroyed) return;
+    this.evidence = null;
+    this.onEvidence(null);
+    this.cache.invalidate();
     this._draw();
   }
   hitTest(clientX, clientY) {
@@ -11390,6 +11406,10 @@ const optional = ['tracks.corrected.json', ...VIEWS.flatMap(view => [
 const agentFiles = new Set([
   'tracks.corrected.json', 'leader/segments_update.json', 'helper/segments_update.json',
 ]);
+const correctionArchivePaths = [...VIEWS.map(view => `${view}/segments.json`),
+  'tracks.corrected.json', ...VIEWS.flatMap(view => [
+  `${view}/segments_update.json`, `${view}/segments_proposal.jsonl`,
+])];
 
 function proposalMaskRows(requests, view) {
   const frames = new Map();
@@ -11776,7 +11796,7 @@ class StaticRecording {
           value = await response.json();
         } else if (response.status === 404) {
           agentError = new Error(`agents.json was not found (${response.status})`);
-          console.warn('[CoLoc agents] Automatic load did not find agents.json', {
+          console.warn('[Loading] Automatic load did not find agents.json', {
             url: agentLocation, status: response.status,
           });
         } else {
@@ -11835,6 +11855,8 @@ class StaticRecording {
     const frames = {}, views = {};
     for (const [index, view] of VIEWS.entries()) {
       const masks = parseJSONLines(documents[index * 2], 'masks', `${view}/masks.jsonl`);
+      if (!this.sourceFrames) this.sourceFrames = {};
+      this.sourceFrames[view] = clone(masks);
       const proposalPath = correctionDocuments[`${view}/segments_proposal.jsonl`] ?
         `${view}/segments_proposal.jsonl` : `${view}-segments_proposal.jsonl`;
       mergeProposalMasks(masks, correctionDocuments[proposalPath], proposalPath);
@@ -11865,6 +11887,7 @@ class StaticRecording {
     this.sourceTrackDocument = clone(sourceTrackDocument); this.sourceSegments = clone(sourceSegments);
     this.browserRestored = browserRestored;
     this.agentsLoaded = agentsLoaded;
+    this.loadState = browserSaved?.saved_at ? 'saved' : agentsLoaded ? 'initial' : 'empty';
     this.agentsError = agentError;
     this.agentSourceFingerprint = agentSourceFingerprint;
     this.initial = clone(project); this.saved = clone(project);
@@ -11886,8 +11909,9 @@ class StaticRecording {
     return {meta: this.meta, project};
   }
 
-  loadInitialTracks(value) {
-    const correctionDocuments = agentCorrections(value);
+  loadCorrections(documents) {
+    const correctionDocuments = Object.fromEntries([...documents]
+      .map(([path, text]) => [path, parseCorrection(path, text)]));
     const projectSegments = clone(this.sourceSegments);
     for (const view of VIEWS) {
       const update = correctionDocuments[`${view}/segments_update.json`] || {};
@@ -11898,20 +11922,31 @@ class StaticRecording {
       }
     }
     const correctedTrackDocument = correctionDocuments['tracks.corrected.json'];
-    const effectiveTrackDocument = correctedTrackDocument || this.sourceTrackDocument;
+    if (!Array.isArray(correctedTrackDocument?.tracks))
+      throw new Error('tracks.corrected.json must follow the tracks.json schema');
     const initial = createProject(this.meta.recording_id, projectSegments,
-      effectiveTrackDocument.tracks, this.meta.annotation_fps, new Set(this.sourceById.keys()));
+      correctedTrackDocument.tracks, this.meta.annotation_fps, new Set(this.sourceById.keys()));
     initial.source_fingerprint = this.sourceFingerprint;
     const project = applyCorrectionFiles(clone(initial), correctionDocuments);
     validateProject(project, {views: this.meta.views, sourceById: this.sourceById});
     project.saved_at = new Date().toISOString();
-    this.agentsLoaded = true; this.browserRestored = false;
-    this.agentsError = null; this.agentSourceFingerprint = value.source_fingerprint;
+    const masksByView = {};
+    for (const view of VIEWS) {
+      const masks = clone(this.sourceFrames[view]);
+      mergeProposalMasks(masks, correctionDocuments[`${view}/segments_proposal.jsonl`],
+        `${view}/segments_proposal.jsonl`);
+      masksByView[view] = masks;
+    }
+    for (const view of VIEWS) this.frames[view].masks = masksByView[view];
+    this.agentsLoaded = false; this.browserRestored = false; this.loadState = 'zipped';
+    this.agentsError = null; this.agentSourceFingerprint = null;
     const stored = this.storeBrowserCorrections(project, this.sourceFingerprint);
     this.initial = clone(project); this.saved = clone(project);
-    console.info('[CoLoc agents] Manually loaded initial tracks', {
-      file: 'agents.json', agent_source_fingerprint: this.agentSourceFingerprint,
-      clip_storage_fingerprint: this.sourceFingerprint,
+    this.meta.input_track_count = correctedTrackDocument.tracks.length;
+    this.meta.unassigned_count = project.tracks.filter(track => track.origin === 'provisional').length;
+    this.meta.labels = [...new Set(project.segments.map(segment => segment.label))].sort();
+    console.info('[Loading] Zipped tracks loaded', {
+      file: 'corrections.zip', clip_storage_fingerprint: this.sourceFingerprint,
     });
     return {project, stored};
   }
@@ -11976,11 +12011,12 @@ function validateProject(project, {views, sourceById}) {
   return project;
 }
 
-return {proposalMaskRows, serializeCorrection, StaticRecording, validateProject};
+return {correctionArchivePaths, proposalMaskRows, serializeCorrection, StaticRecording, validateProject};
 })();
 __coloc_modules.m8 = (() => {
 // Store UTF-8 correction documents in one ZIP without a network dependency.
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 const crcTable = Uint32Array.from({length: 256}, (_, value) => {
   for (let bit = 0; bit < 8; bit++) value = (value >>> 1) ^ ((value & 1) ? 0xedb88320 : 0);
   return value >>> 0;
@@ -12039,7 +12075,67 @@ function zipDocuments(documents) {
   return new Blob([...parts, ...directory, footer], {type: 'application/zip'});
 }
 
-return {zipDocuments};
+async function inflate(bytes) {
+  if (!globalThis.DecompressionStream)
+    throw new Error('This browser cannot read compressed ZIP files');
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+/** Read selected UTF-8 documents from a ZIP. Ignore enclosing directory names. */
+function unzipDocuments(blob, paths) {
+  return readZipDocuments(blob, paths);
+}
+
+async function readZipDocuments(blob, paths) {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let end = -1;
+  for (let offset = Math.max(0, bytes.length - 65557); offset <= bytes.length - 22; offset++)
+    if (view.getUint32(offset, true) === 0x06054b50) end = offset;
+  if (end < 0) throw new Error('The selected file is not a supported ZIP archive');
+  const count = view.getUint16(end + 10, true), directoryOffset = view.getUint32(end + 16, true);
+  if (count === 0xffff || directoryOffset === 0xffffffff)
+    throw new Error('ZIP64 correction archives are not supported');
+  const wanted = new Map(paths.map(path => [path, null]));
+  let offset = directoryOffset;
+  for (let index = 0; index < count; index++) {
+    if (offset + 46 > bytes.length || view.getUint32(offset, true) !== 0x02014b50)
+      throw new Error('The ZIP directory is invalid');
+    const flags = view.getUint16(offset + 8, true), method = view.getUint16(offset + 10, true);
+    const compressedSize = view.getUint32(offset + 20, true);
+    const size = view.getUint32(offset + 24, true);
+    const nameLength = view.getUint16(offset + 28, true);
+    const extraLength = view.getUint16(offset + 30, true);
+    const commentLength = view.getUint16(offset + 32, true);
+    const localOffset = view.getUint32(offset + 42, true);
+    const nameEnd = offset + 46 + nameLength;
+    if (nameEnd > bytes.length) throw new Error('The ZIP directory is invalid');
+    const name = decoder.decode(bytes.subarray(offset + 46, nameEnd)).replaceAll('\\', '/');
+    const path = paths.find(candidate => name === candidate || name.endsWith(`/${candidate}`));
+    if (path) {
+      if (wanted.get(path) !== null) throw new Error(`The ZIP contains more than one ${path}`);
+      if (flags & 1) throw new Error(`${path} is encrypted`);
+      if (method !== 0 && method !== 8) throw new Error(`${path} uses an unsupported ZIP compression method`);
+      if (localOffset + 30 > bytes.length || view.getUint32(localOffset, true) !== 0x04034b50)
+        throw new Error(`${path} has an invalid ZIP entry`);
+      const localNameLength = view.getUint16(localOffset + 26, true);
+      const localExtraLength = view.getUint16(localOffset + 28, true);
+      const start = localOffset + 30 + localNameLength + localExtraLength;
+      if (start + compressedSize > bytes.length) throw new Error(`${path} is truncated`);
+      const content = method === 0 ? bytes.slice(start, start + compressedSize) :
+        await inflate(bytes.slice(start, start + compressedSize));
+      if (content.length !== size) throw new Error(`${path} has an invalid uncompressed size`);
+      wanted.set(path, decoder.decode(content));
+    }
+    offset = nameEnd + extraLength + commentLength;
+  }
+  for (const [path, text] of wanted)
+    if (text === null) throw new Error(`The ZIP is missing ${path}`);
+  return wanted;
+}
+
+return {zipDocuments, unzipDocuments};
 })();
 __coloc_modules.m9 = (() => {
 const TRANSFORMERS_URL = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
@@ -12257,8 +12353,8 @@ const {makeViaStore, sourceChanges, shapePrompt} = __coloc_modules.m1;
 const {MaskOverlay, visibleMaskSegments} = __coloc_modules.m4;
 const {SegmentEditor} = __coloc_modules.m6;
 const {clone, uid, segmentById, activeAt, formatTime, colorFor, editSegment, splitSegment, assignTrack, assignNewTrack, nextTrackId, rejectSegment, reviewedObjectId, assignedTrackId, trackDisplay, trackById, nameNeedsReview, trackReferences, deleteEmptyTrack} = __coloc_modules.m2;
-const {StaticRecording, validateProject, serializeCorrection} = __coloc_modules.m7;
-const {zipDocuments} = __coloc_modules.m8;
+const {StaticRecording, validateProject, serializeCorrection, correctionArchivePaths} = __coloc_modules.m7;
+const {zipDocuments, unzipDocuments} = __coloc_modules.m8;
 const {SlimSam, SamOverlay, ProposalMaskOverlay, PROPOSAL_FPS, encodeMask, nextManualObjectId, nextManualSegmentId, proposalMasksAt} = __coloc_modules.m9;
 
 const $ = id => document.getElementById(id);
@@ -12317,17 +12413,6 @@ function contentKey(value) {
 }
 const isDirty = () => project && contentKey(project) !== savedContent;
 const current = () => segmentById(project, selected);
-function updateInitialTracksControl() {
-  const button = $('load-initial-tracks');
-  const loaded = recording?.agentsLoaded === true;
-  button.classList.toggle('initial-tracks-loaded', loaded);
-  button.textContent = loaded ? 'Tracks loaded' : 'Load tracks';
-  button.title = loaded ?
-    `Agent prereview loaded${recording.agentSourceFingerprint ? ` · ${recording.agentSourceFingerprint}` : ''}` :
-    recording?.agentsError ?
-      `Automatic load failed: ${recording.agentsError.message}. Choose an agents.json file.` :
-      'Choose an agents.json file';
-}
 function toast(message, error = false) {
   clearTimeout(toastTimer);
   $('toast').textContent = message;
@@ -12344,14 +12429,12 @@ function updateStatus() {
   $('save-status').textContent = saving ? 'Saving…' : samLoading ? 'Loading segmentation model…' :
     busy ? 'Validating…' :
     formDirty ? 'Unapplied form changes' : isDirty() ? 'Unsaved changes' :
-      baseRevision ? (recording?.directoryHandle ? 'Corrections saved to files' :
-        'Corrections saved in this browser') :
-        recording?.browserRestored ? 'Loaded saved browser corrections' :
-          recording?.agentsLoaded ? 'Initialized tracks' : 'Loaded from clip files';
+      recording?.loadState === 'saved' ? 'Loaded saved browser corrections' :
+        recording?.loadState === 'zipped' ? 'Loaded zipped tracks' :
+          recording?.loadState === 'initial' ? 'Loaded initial tracks' : 'Loaded empty tracks';
   $('save-status').classList.toggle('dirty', formDirty || isDirty());
   $('save').disabled = locked;
-  $('load-initial-tracks').disabled = locked;
-  updateInitialTracksControl();
+  $('load-zipped-tracks').disabled = locked;
   $('save').title = recording?.directoryHandle ? 'Write corrections into this recording folder' :
     'Save corrections in this browser';
   $('export').disabled = locked;
@@ -13070,6 +13153,7 @@ async function save() {
     const result = await (await api('/api/save', {project: snapshot, base_revision: baseRevision})).json();
     baseRevision = result.revision;
     if (result.stored) recording.browserRestored = true;
+    if (result.stored) recording.loadState = 'saved';
     project.revision = result.revision;
     project.saved_at = result.saved_at;
     savedContent = contentKey(snapshot);
@@ -13098,31 +13182,29 @@ async function exportCorrections() {
   download(zipDocuments([...sourceSegments, ...corrections]), `${folder}-corrections.zip`);
   toast('Downloaded corrections ZIP with leader and helper folders. No videos included.');
 }
-async function loadInitialTracks(file) {
+async function loadZippedTracks(file) {
   await readyForEdit();
   busy = true;
   updateStatus();
-  let value;
   try {
-    try { value = JSON.parse(await file.text()); }
-    catch (error) { throw new Error(`agents.json: ${error.message}`); }
-    const result = recording.loadInitialTracks(value);
+    const documents = await unzipDocuments(file, correctionArchivePaths);
+    const result = recording.loadCorrections(documents);
     project = result.project;
     baseRevision = project.revision;
     savedContent = contentKey(project);
     undo = []; redo = []; batch.clear(); listedTrackId = null;
     for (const editor of Object.values(editors)) editor.clearDirty();
     reconcileSelections();
-    meta.labels = [...new Set(project.segments.map(segment => segment.label))].sort();
+    meta = recording.meta;
     $('category-list').replaceChildren(...meta.labels.map(label => new Option(label)));
     projectToVia();
+    for (const player of Object.values(maskPlayers)) player.invalidate();
     renderAll();
-    toast(result.stored ? 'Loaded initial tracks and saved them in this browser.' :
-      'Loaded initial tracks in memory.');
+    toast(result.stored ? 'Loaded zipped tracks and saved them in this browser.' :
+      'Loaded zipped tracks in memory.');
   } catch (error) {
-    console.error('[CoLoc agents] Manual agents.json load failed', {
+    console.error('[Loading] Zipped tracks load failed', {
       recording_id: meta?.recording_id, file: file.name,
-      agent_source_fingerprint: value?.source_fingerprint || null,
       clip_storage_fingerprint: recording?.sourceFingerprint || null,
     }, error);
     throw error;
@@ -13275,7 +13357,7 @@ async function initialize() {
   $('recording-name').title = meta.recording_id;
   $('recording-name').classList.remove('hidden');
   $('open-recording').classList.remove('hidden');
-  $('load-initial-tracks').classList.remove('hidden');
+  $('load-zipped-tracks').classList.remove('hidden');
   $('category-list').replaceChildren(...meta.labels.map(label => new Option(label)));
   for (const view of Object.keys(meta.views)) {
     selectedByView[view] = null;
@@ -13384,7 +13466,7 @@ async function openRecording(next) {
     $('recording-start-status').textContent = error.message;
     $('recording-start-status').classList.add('error-text');
     for (const id of ['review-actions', 'review-workspace', 'recording-name', 'open-recording',
-      'load-initial-tracks'])
+      'load-zipped-tracks'])
       $(id).classList.add('hidden');
     toast(error.message, true);
   }
@@ -13456,11 +13538,11 @@ $('open-recording').onclick = () => {
   workspace?.pause();
   location.href = new URL(location.pathname, location.href);
 };
-$('load-initial-tracks').onclick = () => $('initial-tracks-input').click();
-$('initial-tracks-input').onchange = run(async () => {
-  const file = $('initial-tracks-input').files[0];
-  $('initial-tracks-input').value = '';
-  if (file) await loadInitialTracks(file);
+$('load-zipped-tracks').onclick = () => $('tracks-zip-input').click();
+$('tracks-zip-input').onchange = run(async () => {
+  const file = $('tracks-zip-input').files[0];
+  $('tracks-zip-input').value = '';
+  if (file) await loadZippedTracks(file);
 });
 
 return {};
