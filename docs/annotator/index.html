@@ -9394,6 +9394,7 @@ __coloc_modules.m0 = (() => {
 
 const noop = () => {};
 const clone = value => JSON.parse(JSON.stringify(value));
+const timelineGroupAid = 'timeline_label';
 const sampledFrame = (seconds, fps, duration) => Math.min(
   Number.isFinite(duration) ? Math.max(0, Math.ceil(duration * fps) - 1) : Infinity,
   Math.max(0, Math.floor(seconds * fps + 1e-6)),
@@ -9738,7 +9739,7 @@ class ViaWorkspace {
     }
     timeline.EDGE_UPDATE_TIME_DELTA = 1 / this.fps;
     timeline.conf = {fps: this.fps};
-    timeline.group_aid_candidate_list = ['label'];
+    timeline.group_aid_candidate_list = [timelineGroupAid];
     this._replaceTimelineGroupSelect(timeline);
     const nativeBoundaryUpdate = timeline._tmetadata_boundary_update.bind(timeline);
     timeline._tmetadata_boundary_update = start => {
@@ -10082,7 +10083,7 @@ class ViaWorkspace {
     if (!timeline || !metadata || metadata.vid !== view || metadata.xy.length) return;
     if (this.layout !== 'both' && this.layout !== view) this.setLayout(view);
     this.setActiveView(view);
-    const group = metadata.av.label;
+    const group = metadata.av[timelineGroupAid];
     this._silentSelection = true;
     try {
       let groupIndex = timeline.gid_list.indexOf(group);
@@ -10205,14 +10206,14 @@ class ViaWorkspace {
       // invalidate both caches before constructing any replacement canvas.
       timeline.tmetadata_gtimeline_mid = {};
       timeline.smid = {};
-      timeline._group_init('label');
+      timeline._group_init(timelineGroupAid);
       timeline._visibleGroupWindow = '';
       timeline._tmetadata_boundary_update(start);
       timeline._tmetadata_boundary_fetch_all_mid();
       timeline._tmetadata_gtimeline_draw();
       if (selected && this.data.store.metadata[selected]) {
         const metadata = this.data.store.metadata[selected];
-        const group = metadata.av.label;
+        const group = metadata.av[timelineGroupAid];
         timeline.selected_gid = group;
         timeline.selected_gindex = timeline.gid_list.indexOf(group);
         timeline.selected_mindex = timeline.tmetadata_gtimeline_mid[group]?.indexOf(selected) ?? -1;
@@ -10261,7 +10262,7 @@ class ViaWorkspace {
       timeline._tmetadata_gtimeline_draw();
       this._replaceTimelineGroupSelect(timeline);
       if (selected && this.data.store.metadata[selected]) {
-        const group = this.data.store.metadata[selected].av.label;
+        const group = this.data.store.metadata[selected].av[timelineGroupAid];
         timeline.selected_gid = group;
         timeline.selected_gindex = timeline.gid_list.indexOf(group);
         timeline.selected_mindex = timeline.tmetadata_gtimeline_mid[group]?.indexOf(selected) ?? -1;
@@ -10362,6 +10363,7 @@ function makeViaStore(project, meta, mediaURL) {
       },
     },
     attribute: {
+      timeline_label: attribute('Timeline category', 'FILE1_Z2_XY0'),
       label: attribute('Category', 'FILE1_Z2_XY0'),
       prompt_label: attribute('Proposal category', 'FILE1_Z1_XY1'),
     },
@@ -10372,11 +10374,15 @@ function makeViaStore(project, meta, mediaURL) {
       src: mediaURL(meta.views[view].video_url)};
     store.view[view] = {fid_list: [view]};
   }
+  const personTracks = new Set(project.tracks
+    .filter(track => track.label.trim().toLowerCase() === 'person')
+    .map(track => track.track_id));
   for (const segment of project.segments) {
     if (segment.rejected) continue;
     store.metadata[segment.segment_id] = {
       vid: segment.view, flg: 0, z: temporalCoordinates(segment, meta.annotation_fps), xy: [],
-      av: {label: segment.label},
+      av: {timeline_label: segment.entity_type === 'person' || personTracks.has(segment.track_id) ?
+        'person' : segment.label, label: segment.label},
     };
   }
   // Identity, provenance, review state, and proposed processing intervals live in
@@ -12631,9 +12637,7 @@ function renderTracks() {
 function renderList() {
   const search = $('search').value.toLowerCase(), view = $('view-filter').value;
   const filter = $('review-filter').value;
-  const people = personTrackIds();
   const matching = project.segments.filter(segment =>
-    (!$('hide-people').checked || !isPerson(segment, people)) &&
     (listedTrackId === null || segment.track_id === listedTrackId) &&
     (view === 'all' || segment.view === view) &&
     (!search || [segment.label, reviewedObjectId(segment), segment.segment_id, segment.track_id].join(' ').toLowerCase().includes(search)) &&
