@@ -733,7 +733,7 @@ dialog{width:470px;max-width:95vw;padding:16px;border:1px solid #555}dialog labe
       <label>View <select id="layout"><option value="both">Both</option><option value="leader">Leader</option><option value="helper">Helper</option></select></label>
       <label>Edit <select id="active-view"><option value="leader">Leader</option><option value="helper">Helper</option></select></label>
       <label><input id="show-masks" type="checkbox" checked> Masks</label>
-      <label><input id="ignore-people" type="checkbox" checked> Ignore people</label>
+      <label><input id="hide-people" type="checkbox" checked> Hide people masks</label>
       <label>Opacity <input id="opacity" type="range" min="5" max="65" value="25"></label>
       <div id="sam-progress" class="sam-progress hidden" aria-live="polite"><progress max="1"></progress><span>Loading segmentation model…</span></div>
       <button id="shortcuts" title="Keyboard shortcuts" aria-label="Keyboard shortcuts">?</button>
@@ -12460,11 +12460,20 @@ function reconcileSelections() {
   }
   selected = selectedByView[workspace?.activeView || Object.keys(meta.views)[0]];
 }
+function updateViaCache() {
+  data._cache_update();
+  if (!$('hide-people').checked) return;
+  const people = personTrackIds();
+  const hidden = new Set(project.segments.filter(segment => isPerson(segment, people))
+    .map(segment => segment.segment_id));
+  for (const view of Object.keys(data.cache.mid_list)) data.cache.mid_list[view] =
+    data.cache.mid_list[view].filter(id => !hidden.has(id));
+}
 function projectToVia() {
   if (!data || !workspace) return;
   const store = makeViaStore(project, meta, scopedURL);
   data.store.metadata = store.metadata;
-  data._cache_update();
+  updateViaCache();
   workspace.refresh();
   drawMasks();
 }
@@ -12529,7 +12538,7 @@ async function selectFrameObject(view, id) {
   if (pendingPrompt || busy || saving) return;
   const index = presentedFrames[view];
   if (!visibleMaskSegments(project.segments, view, index, frameData[view],
-    $('ignore-people').checked, personTrackIds())
+    $('hide-people').checked, personTrackIds())
     .some(segment => segment.segment_id === id)) {
     throw new Error('This object is no longer in the current frame. Pause and choose it again.');
   }
@@ -12622,7 +12631,9 @@ function renderTracks() {
 function renderList() {
   const search = $('search').value.toLowerCase(), view = $('view-filter').value;
   const filter = $('review-filter').value;
+  const people = personTrackIds();
   const matching = project.segments.filter(segment =>
+    (!$('hide-people').checked || !isPerson(segment, people)) &&
     (listedTrackId === null || segment.track_id === listedTrackId) &&
     (view === 'all' || segment.view === view) &&
     (!search || [segment.label, reviewedObjectId(segment), segment.segment_id, segment.track_id].join(' ').toLowerCase().includes(search)) &&
@@ -12759,7 +12770,7 @@ function renderFrameObjects(view) {
   if (!panel || !project || !meta) return;
   const index = presentedFrames[view], evidence = frameData[view];
   const loading = !Number.isInteger(index) || !evidence || evidence.source_frame_index !== index;
-  const ignorePeople = $('ignore-people').checked;
+  const ignorePeople = $('hide-people').checked;
   const people = personTrackIds();
   const objects = visibleMaskSegments(project.segments, view, index, evidence, ignorePeople, people);
   const proposals = project.requests.filter(request => request.kind === 'sam_mask' &&
@@ -12826,7 +12837,7 @@ function alignOverlays() {
 }
 function drawProposalMasks(view) {
   proposalOverlays[view]?.render(project.requests, view, presentedFrames[view],
-    Number($('opacity').value), $('show-masks').checked, $('ignore-people').checked,
+    Number($('opacity').value), $('show-masks').checked, $('hide-people').checked,
     personTrackIds());
 }
 function drawMasks() {
@@ -12837,7 +12848,7 @@ function drawMasks() {
     segments: project.segments.filter(segment => segment.view === view),
     selectedId: selectedByView[view], opacity: Number($('opacity').value),
     showMasks: $('show-masks').checked,
-    ignorePeople: $('ignore-people').checked,
+    ignorePeople: $('hide-people').checked,
     personTrackIds: people,
     interactive: !pendingPrompt && !busy && !saving && !samLoading && !samInference,
   });
@@ -13262,7 +13273,10 @@ function bind() {
   for (const button of document.querySelectorAll('[data-view].camera-select'))
     button.onclick = run(async () => { await readyForEdit(); workspace.setActiveView(button.dataset.view); });
   $('show-masks').onchange = drawMasks;
-  $('ignore-people').onchange = drawMasks;
+  $('hide-people').onchange = () => {
+    projectToVia();
+    renderList();
+  };
   $('opacity').oninput = drawMasks;
   for (const id of ['search', 'view-filter', 'review-filter'])
     $(id).oninput = () => { rowLimit = 120; renderList(); };
@@ -13383,7 +13397,7 @@ async function initialize() {
   }
   data = new _via_data();
   data.store = makeViaStore(project, meta, scopedURL);
-  data._cache_update();
+  updateViaCache();
   workspace = new ViaWorkspace({
     panes: {leader: $('leader-via'), helper: $('helper-via')}, data, fps: meta.annotation_fps,
     timelinePanes: {leader: $('leader-timeline'), helper: $('helper-timeline')},
@@ -13423,7 +13437,7 @@ async function initialize() {
         if (match) {
           const people = personTrackIds();
           const proposed = proposalMasksAt(project.requests, view, presentedFrames[view])
-            .filter(({request}) => !$('ignore-people').checked || !isPerson(request, people)).length;
+            .filter(({request}) => !$('hide-people').checked || !isPerson(request, people)).length;
           masks.textContent = `${Number(match[2]) + proposed} masks`;
           $(`${view}-status`).textContent = `Frame ${match[1]}${match[3]}`;
         } else {
