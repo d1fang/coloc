@@ -9830,23 +9830,20 @@ class ViaWorkspace {
       // currentTime here is only a seek target and must not replace that report.
       this._reportFallbackFrame(view);
       this._reportTime();
+      this._recoverBuffering();
     });
     this._listen(video, 'ratechange', () => this.setRate(video.playbackRate));
     this._listen(video, 'waiting', () => {
       if (!this._wantedPlaying || this._buffering) return;
-      this._buffering = true;
-      this._notifyPlaybackState();
-      for (const media of Object.values(this.videos)) media.pause();
-    });
-    this._listen(video, 'canplay', () => {
-      if (this._buffering && this._wantedPlaying &&
-          Object.values(this.videos).every(media => media.readyState >= 3)) {
-        this._buffering = false;
-        this._alignTime(this.videos[this.activeView].currentTime, this.activeView);
+      queueMicrotask(() => {
+        if (!this._wantedPlaying || this._buffering || this._videosReady()) return;
+        this._buffering = true;
         this._notifyPlaybackState();
-        this._playAll();
-      }
+        for (const media of Object.values(this.videos)) media.pause();
+      });
     });
+    this._listen(video, 'canplay', () => this._recoverBuffering());
+    this._listen(video, 'progress', () => this._recoverBuffering());
     this._listen(video, 'error', () => {
       if (this._destroyed || !video.error) return;
       const kinds = {1: 'aborted', 2: 'network error', 3: 'decode error', 4: 'unsupported source'};
@@ -9864,6 +9861,19 @@ class ViaWorkspace {
     if (state === this._playbackState) return;
     this._playbackState = state;
     this.onPlaybackState({state, playing: this._wantedPlaying, buffering: this._buffering});
+  }
+
+  _videosReady() {
+    return Object.values(this.videos).every(media => !media.seeking && media.readyState >= 3);
+  }
+
+  _recoverBuffering() {
+    if (!this._buffering || !this._wantedPlaying || !this._videosReady()) return false;
+    this._buffering = false;
+    this._alignTime(this.videos[this.activeView].currentTime, this.activeView);
+    this._notifyPlaybackState();
+    this._playAll();
+    return true;
   }
 
   // onFrame(view, frameIndex, mediaTime) follows each video's presented frame,
@@ -9982,6 +9992,7 @@ class ViaWorkspace {
 
   _tick() {
     if (this._destroyed) return;
+    this._recoverBuffering();
     const master = this.videos[this.activeView];
     if (master && this._wantedPlaying && !this._buffering && !master.seeking) {
       const maximumDrift = Math.max(0.25, 1 / this.fps);
